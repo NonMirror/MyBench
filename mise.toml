@@ -1,0 +1,39 @@
+# MyBench toolchain and repeatable local tasks.
+# mise provisions Python/uv and creates the project-local environment used by uv.
+min_version = "2024.1.0"
+
+[tools]
+python = "3.14"
+uv = "latest"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+PYTHONPATH = "{{config_root}}"
+
+[tasks.install]
+description = "Create/synchronize the uv environment"
+run = "uv sync"
+
+[tasks.test]
+description = "Run the MyBench unit tests"
+run = "uv run python -m unittest discover -s tests -v"
+
+[tasks.lint]
+description = "Run Python bytecode/import syntax checks"
+run = "uv run python -m compileall -q mybench tests"
+
+[tasks.discover]
+description = "Enumerate all CTFbench pwn/rev seeds"
+run = "uv run mybench discover --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev"
+
+[tasks.generate]
+description = "Generate one deterministic variant per pwn/rev seed"
+run = "uv run mybench generate --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev --output {{config_root}}/generated --variants-per-seed 1 --clean"
+
+[tasks.validate]
+description = "Validate generated variants"
+run = "uv run mybench validate --input {{config_root}}/generated"
+
+[tasks.pipeline]
+description = "Generate and validate all pwn/rev variants"
+run = "uv run mybench pipeline --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev --output {{config_root}}/generated --variants-per-seed 1 --clean"

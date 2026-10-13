@@ -1,0 +1,29 @@
+# --- python / tooling ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# --- generated pipeline outputs ---
+# ~640MB of mutated CTF variants. Also contains unredacted flags/answers
+# embedded in binaries and archives, so it must never be published.
+generated/
+
+# --- build artifacts and executables ---
+# Challenge binaries, compiled objects and shared libraries are never
+# source: they are either rebuilt by the pipeline or live under generated/.
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.bin
+*.elf
+*.dSYM/
+
+# --- local junk ---
+.DS_Store

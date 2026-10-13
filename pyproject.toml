@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mybench-mutator"
+version = "0.1.0"
+description = "Automated pwn/reverse mutation and validation toolkit for CTFbench"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+mybench = "mybench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
