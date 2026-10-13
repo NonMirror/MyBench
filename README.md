@@ -91,11 +91,25 @@ uv run mybench pipeline --ctfbench ../CTFbench --output ./generated \
   `2018q-rev-a_walk_through_x86_part_1`、`2021q-rev-checker`、`2022q-rev-the_big_bang`、
   `2023q-pwn-my_first_pwnie`、`2023q-rev-baby_s_first`；`.rs` 的
   `2017f-rev-rusty_road`、`2020f-rev-yeet`；`.h` 的 `2019q-pwn-pop_goes_the_printer`；
-  `.java` 的 `2022f-rev-roulette`。其余 58 个虽然发现了 C/C++ 源码，但兼容的部署
-  artifact 重建失败，生成器因此恢复原源码，避免“源码变了、实际运行文件没变”。
+  `.java` 的 `2022f-rev-roulette`。其余 58 个虽然发现了可处理的源码，但兼容的部署
+  artifact 重建失败，生成器因此恢复原源码，避免“源码变了、实际运行文件没变”。这
+  58 个按 manifest 的底层原因分为：33 个没有同 basename 可执行文件，10 个源码重建
+  本身不支持（Python 7、Go 3），8 个旧 API/隐式声明被编译器拒绝，1 个架构/格式不匹配，
+  1 个 C++17 要求，1 个 `_start` 链接冲突，1 个普通编译失败，1 个依赖链接失败，
+  1 个缺少 KVM guest 对象，1 个内联汇编不兼容。
 - `opaque_guard_injection` 的其它样本是 23 个没有候选源码的预编译题、上述 58 个因
   部署 artifact 重建失败而恢复源码的样本，以及 `.h`/`.rs`/`.java` 文件；没有函数
   定义可安全插入时只记录 `source_mutation_skipped`。
+
+其中 23 个没有候选源码的样本是：`2013q-pwn-csaw_diary`、`2014f-rev-odd`、
+`2014f-rev-return_of_the_weiner`、`2014q-pwn-ish`、`2014q-rev-aerosol_can`、
+`2014q-rev-weissman`、`2015f-pwn-hipster`、`2015f-rev-wyvern2`、
+`2015q-rev-ftp`、`2015q-rev-wyvern`、`2016f-rev-palo_alto`、`2016q-rev-deedeedee`、
+`2017f-pwn-humm_sch_t`、`2017q-rev-bananascript`、`2018f-rev-1nsayne`、
+`2018q-rev-a_walk_through_x86_part_2`、`2019f-rev-steady_counting`、
+`2019q-rev-wizkid`、`2020f-rev-sourcery`、`2020q-pwn-blox2`、`2020q-pwn-pwnvoltex`、
+`2022q-rev-dockreleakage`、`2023f-rev-unvirtualization`。这些题目只有预编译入口、
+数据或非候选源码，生成器无法证明源码注入会进入实际运行路径。
 - `compiled_artifact_rebuild` 的 67 个 skipped 中，35 个没有与源码同 basename 的已部署
   可执行文件，不能证明源码会进入运行路径；17 个是 Go/Python 等不在自动 C/C++ 重建
   范围内（`.py` 14 个、`.go` 3 个）；其余 15 个因编译器/链接器、架构或语言标准
