@@ -16,6 +16,34 @@ from .model import Seed
 
 
 OPAQUE_GUARD_PREFIX = "mybench_opaque_guard_"
+DECOY_FUNCTION_PREFIX = "mybench_decoy_function_"
+DEAD_CODE_PREFIX = "mybench_dead_code_"
+DUPLICATE_STRING_PREFIX = "mybench_duplicate_string_"
+IRRELEVANT_SYSCALL_PREFIX = "mybench_irrelevant_syscall_"
+SOURCE_NOISE_OPERATORS = (
+    "decoy_function_injection",
+    "dead_code_injection",
+    "duplicate_string_injection",
+    "irrelevant_syscall_injection",
+)
+EXCLUDED_TECHNIQUES = ("control_flow_flattening", "ollvm", "packing", "shell")
+SOURCE_NOISE_LIMITS = {
+    "max_decoy_functions": 2,
+    "max_dead_code_blocks": 2,
+    "max_duplicate_strings": 3,
+    "max_irrelevant_syscalls": 1,
+}
+SOURCE_NOISE_LIMIT_MAX = {
+    "max_decoy_functions": 32,
+    "max_dead_code_blocks": 32,
+    "max_duplicate_strings": 64,
+    "max_irrelevant_syscalls": 16,
+}
+DEFAULT_NOISE_POLICY = {
+    "enabled_operators": list(SOURCE_NOISE_OPERATORS),
+    "excluded_techniques": list(EXCLUDED_TECHNIQUES),
+    "limits": dict(SOURCE_NOISE_LIMITS),
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -99,6 +127,145 @@ def _source_candidate(seed: Seed) -> Optional[Path]:
 
 def _opaque_identifier(variant_id: str) -> str:
     return OPAQUE_GUARD_PREFIX + re.sub(r"[^A-Za-z0-9_]", "_", variant_id)
+
+
+def _normalize_noise_policy(policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    candidate = copy.deepcopy(DEFAULT_NOISE_POLICY if policy is None else policy)
+    if not isinstance(candidate, dict):
+        raise ValueError("noise policy must be an object")
+    enabled = candidate.get("enabled_operators")
+    excluded = candidate.get("excluded_techniques")
+    limits = candidate.get("limits", SOURCE_NOISE_LIMITS)
+    if not isinstance(enabled, list) or any(not isinstance(item, str) for item in enabled):
+        raise ValueError("noise_policy.enabled_operators must be a list of strings")
+    if len(set(enabled)) != len(enabled) or any(item not in SOURCE_NOISE_OPERATORS for item in enabled):
+        raise ValueError("noise_policy.enabled_operators contains an unknown or duplicate operator")
+    if not isinstance(excluded, list) or any(not isinstance(item, str) for item in excluded):
+        raise ValueError("noise_policy.excluded_techniques must be a list of strings")
+    if len(set(excluded)) != len(excluded) or set(EXCLUDED_TECHNIQUES) - set(excluded):
+        raise ValueError("noise policy must exclude control-flow flattening, OLLVM, packing, and shell")
+    if any(item not in EXCLUDED_TECHNIQUES for item in excluded):
+        raise ValueError("noise_policy.excluded_techniques contains an unknown technique")
+    if not isinstance(limits, dict):
+        raise ValueError("noise_policy.limits must be an object")
+    normalized_limits = dict(SOURCE_NOISE_LIMITS)
+    for key, value in limits.items():
+        if key not in normalized_limits or isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"invalid noise policy limit: {key}")
+        if value < 0 or value > SOURCE_NOISE_LIMIT_MAX[key]:
+            raise ValueError(f"noise policy limit is out of range: {key}")
+        normalized_limits[key] = value
+    return {
+        "enabled_operators": list(enabled),
+        "excluded_techniques": list(excluded),
+        "limits": normalized_limits,
+    }
+
+
+def _noise_identifier(prefix: str, variant_id: str) -> str:
+    return prefix + re.sub(r"[^A-Za-z0-9_]", "_", variant_id)
+
+
+def _noise_language(source: Path) -> str:
+    suffix = source.suffix.lower()
+    if suffix in {".cc", ".cpp", ".cxx"}:
+        return "cpp"
+    if suffix in {".c", ".m", ".mm"}:
+        return "c"
+    return suffix.lstrip(".") or "unknown"
+
+
+def _c_function_match(content: str) -> Optional[re.Match[str]]:
+    return re.search(r"\bmain\s*\([^{};]*\)\s*\{", content) or re.search(
+        r"\b[A-Za-z_][\w:\s*<&>,~]*\s+[A-Za-z_]\w*\s*\([^{};]*\)\s*\{", content
+    )
+
+
+def _noise_skip(source: Path, relative_path: Path, operator: str, reason: str) -> Dict[str, Any]:
+    digest = sha256_file(source)
+    return {
+        "operator": operator,
+        "strategy": "source_noise_skipped",
+        "language": _noise_language(source),
+        "path": relative_path.as_posix(),
+        "before_sha256": digest,
+        "after_sha256": digest,
+        "marker": None,
+        "changed": False,
+        "reason": reason,
+    }
+
+
+def _inject_c_noise(source: Path, relative_path: Path, variant_id: str, operator: str) -> Dict[str, Any]:
+    before_hash = sha256_file(source)
+    suffix = source.suffix.lower()
+    if suffix not in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}:
+        return _noise_skip(source, relative_path, operator, f"source noise supports C/C++ only, got {suffix or '<none>'}")
+    try:
+        content = source.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return _noise_skip(source, relative_path, operator, "source is not valid UTF-8")
+    function_match = _c_function_match(content)
+    if function_match is None:
+        return _noise_skip(source, relative_path, operator, "no compatible C/C++ function definition found")
+    tag = hashlib.sha256((variant_id + ":" + operator).encode()).hexdigest()[:16]
+    if operator == "decoy_function_injection":
+        marker = _noise_identifier(DECOY_FUNCTION_PREFIX, variant_id)
+        helper = f"\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static unsigned long long {marker}(unsigned long long seed) {{\n#else\nstatic unsigned long long {marker}(unsigned long long seed) {{\n#endif\n    volatile unsigned long long state = seed ^ 0x{tag}ULL;\n    return state + 0x{tag}ULL;\n}}\n"
+        body = "\n"
+        strategy = "noinline_unused_decoy_function"
+    elif operator == "dead_code_injection":
+        marker = _noise_identifier(DEAD_CODE_PREFIX, variant_id)
+        helper = f"\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static int {marker}(void) {{\n#else\nstatic int {marker}(void) {{\n#endif\n    volatile unsigned long long state = 0x{tag}ULL;\n    return (state ^ 0x{tag}ULL) == 1ULL;\n}}\n"
+        body = f"\n    if ({marker}()) {{\n        volatile unsigned long long mybench_dead_sink = 0x{tag}ULL;\n        mybench_dead_sink ^= 0x{tag}ULL;\n        (void)mybench_dead_sink;\n    }}\n"
+        strategy = "volatile_false_branch"
+    elif operator == "duplicate_string_injection":
+        marker = _noise_identifier(DUPLICATE_STRING_PREFIX, variant_id)
+        a, b = marker + "_a", marker + "_b"
+        helper = f'\nstatic volatile const char {a}[] = "mybench decoy diagnostic {tag}";\nstatic volatile const char {b}[] = "mybench decoy diagnostic {tag}";\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static unsigned long long {marker}(void) {{\n#else\nstatic unsigned long long {marker}(void) {{\n#endif\n    return (unsigned char){a}[0] ^ (unsigned char){b}[0];\n}}\n'
+        body = f"\n    {{\n        volatile unsigned long long mybench_duplicate_sink = {marker}();\n        (void)mybench_duplicate_sink;\n    }}\n"
+        strategy = "volatile_duplicate_literals"
+    elif operator == "irrelevant_syscall_injection":
+        marker = _noise_identifier(IRRELEVANT_SYSCALL_PREFIX, variant_id)
+        helper = f"\n#if defined(__unix__) || defined(__APPLE__)\n#include <unistd.h>\n#endif\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static long {marker}(void) {{\n#else\nstatic long {marker}(void) {{\n#endif\n#if defined(__unix__) || defined(__APPLE__)\n    return (long)getpid();\n#else\n    return 0L;\n#endif\n}}\n"
+        body = f"\n    {{\n        volatile unsigned long long mybench_syscall_gate = 0x{tag}ULL;\n        if ((mybench_syscall_gate ^ 0x{tag}ULL) == 1ULL) {{\n            volatile long mybench_syscall_sink = {marker}();\n            (void)mybench_syscall_sink;\n        }}\n    }}\n"
+        strategy = "guarded_getpid_read_only"
+    else:
+        raise ValueError(f"unknown source noise operator: {operator}")
+    insert_at = function_match.end()
+    _replace_file(source, helper + content[:insert_at] + body + content[insert_at:])
+    return {
+        "operator": operator,
+        "strategy": strategy,
+        "language": _noise_language(source),
+        "path": relative_path.as_posix(),
+        "before_sha256": before_hash,
+        "after_sha256": sha256_file(source),
+        "marker": marker,
+        "changed": before_hash != sha256_file(source),
+    }
+
+
+def _mutate_source_noise(source: Path, relative_path: Path, variant_id: str,
+                         enabled_operators: Optional[Iterable[str]] = None,
+                         limits: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+    enabled = set(SOURCE_NOISE_OPERATORS if enabled_operators is None else enabled_operators)
+    limit_keys = {
+        "decoy_function_injection": "max_decoy_functions",
+        "dead_code_injection": "max_dead_code_blocks",
+        "duplicate_string_injection": "max_duplicate_strings",
+        "irrelevant_syscall_injection": "max_irrelevant_syscalls",
+    }
+    results = []
+    for operator in SOURCE_NOISE_OPERATORS:
+        if operator not in enabled:
+            continue
+        key = limit_keys[operator]
+        if limits is not None and limits.get(key, 0) <= 0:
+            results.append(_noise_skip(source, relative_path, operator, f"operator disabled by policy limit {key}=0"))
+        else:
+            results.append(_inject_c_noise(source, relative_path, variant_id, operator))
+    return results
 
 
 def _mutate_source(source: Path, relative_path: Path, variant_id: str) -> Dict[str, Any]:
@@ -808,9 +975,15 @@ def _sanitize_challenge_json(
     _replace_file(variant_dir / "challenge.json", json.dumps(public, indent=2, ensure_ascii=False) + "\n")
 
 
-def create_variant(seed: Seed, output_root: Path, ordinal: int = 1) -> Path:
+def create_variant(
+    seed: Seed,
+    output_root: Path,
+    ordinal: int = 1,
+    noise_policy: Optional[Dict[str, Any]] = None,
+) -> Path:
     """Materialize one deterministic variant for every supported seed."""
 
+    normalized_noise_policy = _normalize_noise_policy(noise_policy)
     variant_id = f"{seed.dataset_key}__v{ordinal:02d}"
     relative_parent = Path(seed.category) / seed.split
     variant_dir = output_root / "variants" / relative_parent / _safe_component(variant_id)
@@ -827,6 +1000,15 @@ def create_variant(seed: Seed, output_root: Path, ordinal: int = 1) -> Path:
         copied_source = variant_dir / relative_source
         source_operation = _mutate_source(copied_source, relative_source, variant_id)
         operations.append(source_operation)
+        operations.extend(
+            _mutate_source_noise(
+                copied_source,
+                relative_source,
+                variant_id,
+                normalized_noise_policy["enabled_operators"],
+                normalized_noise_policy["limits"],
+            )
+        )
         if source_operation.get("operator") == "opaque_guard_injection":
             rebuild_operation = _rebuild_compiled_artifact(variant_dir, seed, source_operation)
             operations.append(rebuild_operation)
@@ -863,6 +1045,22 @@ def create_variant(seed: Seed, output_root: Path, ordinal: int = 1) -> Path:
                     "changed": False,
                 }
             )
+            restored_hash = sha256_file(copied_source)
+            for noise_operation in operations:
+                if (
+                    noise_operation.get("operator") in SOURCE_NOISE_OPERATORS
+                    and noise_operation.get("path") == relative_source.as_posix()
+                ):
+                    noise_operation.update(
+                        {
+                            "strategy": "source_noise_skipped",
+                            "before_sha256": restored_hash,
+                            "after_sha256": restored_hash,
+                            "marker": None,
+                            "changed": False,
+                            "reason": "compatible executable rebuild failed; source restored",
+                        }
+                    )
     # When no compatible source rebuild reached the deployed artifact, try a
     # deterministic in-place CFG mutation on the actual native entrypoint.
     # This is deliberately a separate operator: a wrapper or source edit is
@@ -888,6 +1086,7 @@ def create_variant(seed: Seed, output_root: Path, ordinal: int = 1) -> Path:
         "category": seed.category,
         "seed_path": seed.relative_seed_path,
         "variant_path": variant_dir.relative_to(output_root).as_posix(),
+        "noise_policy": normalized_noise_policy,
         "seed_metadata": {
             "name": seed.metadata.get("name"),
             "points": seed.metadata.get("points"),
@@ -954,10 +1153,16 @@ def create_variant(seed: Seed, output_root: Path, ordinal: int = 1) -> Path:
     return variant_dir
 
 
-def generate(seeds: Iterable[Seed], output_root: Path, variants_per_seed: int = 1) -> List[Path]:
+def generate(
+    seeds: Iterable[Seed],
+    output_root: Path,
+    variants_per_seed: int = 1,
+    noise_policy: Optional[Dict[str, Any]] = None,
+) -> List[Path]:
     output_root.mkdir(parents=True, exist_ok=True)
+    normalized_noise_policy = _normalize_noise_policy(noise_policy)
     created: List[Path] = []
     for seed in seeds:
         for ordinal in range(1, variants_per_seed + 1):
-            created.append(create_variant(seed, output_root, ordinal))
+            created.append(create_variant(seed, output_root, ordinal, normalized_noise_policy))
     return created
