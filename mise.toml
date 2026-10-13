@@ -28,7 +28,7 @@ run = "uv run mybench discover --ctfbench {{config_root}}/../CTFbench --split al
 
 [tasks.generate]
 description = "Generate one deterministic variant per pwn/rev seed"
-run = "uv run mybench generate --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev --output {{config_root}}/generated --variants-per-seed 1 --clean"
+run = "uv run mybench generate --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev --output {{config_root}}/generated --variants-per-seed 1 --noise-policy {{config_root}}/noise_policy.example.json --clean"
 
 [tasks.validate]
 description = "Validate generated variants"
@@ -36,4 +36,4 @@ run = "uv run mybench validate --input {{config_root}}/generated"
 
 [tasks.pipeline]
 description = "Generate and validate all pwn/rev variants"
-run = "uv run mybench pipeline --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev --output {{config_root}}/generated --variants-per-seed 1 --clean"
+run = "uv run mybench pipeline --ctfbench {{config_root}}/../CTFbench --split all --category pwn rev --output {{config_root}}/generated --variants-per-seed 1 --noise-policy {{config_root}}/noise_policy.example.json --clean"

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "noise_policy": {
+    "enabled_operators": [
+      "decoy_function_injection",
+      "dead_code_injection",
+      "duplicate_string_injection",
+      "irrelevant_syscall_injection"
+    ],
+    "excluded_techniques": [
+      "control_flow_flattening",
+      "ollvm",
+      "packing",
+      "shell"
+    ],
+    "limits": {
+      "max_decoy_functions": 2,
+      "max_dead_code_blocks": 2,
+      "max_duplicate_strings": 3,
+      "max_irrelevant_syscalls": 1
+    }
+  }
+}

@@ -11,7 +11,26 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from .mutators import OPAQUE_GUARD_PREFIX, _cfg_witness, sha256_file
+from .mutators import (
+    DECOY_FUNCTION_PREFIX,
+    DEAD_CODE_PREFIX,
+    DUPLICATE_STRING_PREFIX,
+    IRRELEVANT_SYSCALL_PREFIX,
+    OPAQUE_GUARD_PREFIX,
+    SOURCE_NOISE_OPERATORS,
+    _cfg_witness,
+    sha256_file,
+)
+
+_SOURCE_OPERATORS = ("opaque_guard_injection",) + SOURCE_NOISE_OPERATORS
+_SOURCE_MARKER_PREFIXES = {
+    "opaque_guard_injection": OPAQUE_GUARD_PREFIX,
+    "decoy_function_injection": DECOY_FUNCTION_PREFIX,
+    "dead_code_injection": DEAD_CODE_PREFIX,
+    "duplicate_string_injection": DUPLICATE_STRING_PREFIX,
+    "irrelevant_syscall_injection": IRRELEVANT_SYSCALL_PREFIX,
+}
+_EXCLUDED_TECHNIQUES = {"control_flow_flattening", "ollvm", "packing", "shell"}
 
 
 def _run(command: List[str], cwd: Path, timeout: int) -> Dict[str, Any]:
@@ -191,25 +210,80 @@ def validate_manifest(manifest_path: Path, build: bool = False) -> Dict[str, Any
     if missing_declared:
         errors.append("declared files missing: " + ", ".join(missing_declared))
 
+    noise_policy = manifest.get("noise_policy")
+    if noise_policy is not None:
+        if not isinstance(noise_policy, dict):
+            errors.append("noise_policy must be an object")
+        else:
+            enabled = noise_policy.get("enabled_operators")
+            excluded = noise_policy.get("excluded_techniques")
+            if (
+                not isinstance(enabled, list)
+                or any(not isinstance(item, str) for item in enabled)
+                or len(set(enabled)) != len(enabled)
+                or any(item not in SOURCE_NOISE_OPERATORS for item in enabled)
+            ):
+                errors.append("noise_policy.enabled_operators is invalid")
+            if (
+                not isinstance(excluded, list)
+                or any(not isinstance(item, str) for item in excluded)
+                or not _EXCLUDED_TECHNIQUES.issubset(set(excluded))
+                or any(item not in _EXCLUDED_TECHNIQUES for item in excluded)
+            ):
+                errors.append("noise_policy.excluded_techniques is invalid")
+            limits = noise_policy.get("limits")
+            if limits is not None:
+                bounds = {
+                    "max_decoy_functions": (0, 32),
+                    "max_dead_code_blocks": (0, 32),
+                    "max_duplicate_strings": (0, 64),
+                    "max_irrelevant_syscalls": (0, 16),
+                }
+                if not isinstance(limits, dict) or set(limits) != set(bounds):
+                    errors.append("noise_policy.limits is invalid")
+                elif any(
+                    isinstance(limits[key], bool)
+                    or not isinstance(limits[key], int)
+                    or not low <= limits[key] <= high
+                    for key, (low, high) in bounds.items()
+                ):
+                    errors.append("noise_policy.limits contains an out-of-range value")
+
     operation_results: List[Dict[str, Any]] = []
+    source_hash_state: Dict[str, str] = {}
     for operation in manifest.get("operations", []):
         rel = operation.get("path")
-        if rel and operation.get("operator") == "opaque_guard_injection":
+        operator = operation.get("operator")
+        if rel and operator in _SOURCE_OPERATORS:
             path = variant_dir / rel
             if not path.exists():
                 errors.append(f"mutated source missing: {rel}")
             else:
-                after = sha256_file(path)
-                if after != operation.get("after_sha256"):
-                    errors.append(f"mutated source hash mismatch: {rel}")
+                before_hash = operation.get("before_sha256")
+                after_hash = operation.get("after_sha256")
+                previous_hash = source_hash_state.get(str(rel))
+                if previous_hash is not None and before_hash != previous_hash:
+                    errors.append(f"source mutation hash chain mismatch: {rel}")
+                if operation.get("changed") and before_hash == after_hash:
+                    errors.append(f"source mutation is marked changed but hashes are identical: {rel}")
+                source_hash_state[str(rel)] = str(after_hash or "")
                 try:
                     text = path.read_text(encoding="utf-8")
                     marker = operation.get("marker")
-                    if not marker or not str(marker).startswith(OPAQUE_GUARD_PREFIX) or str(marker) not in text:
-                        errors.append(f"opaque guard symbol missing from source: {rel}")
+                    prefix = _SOURCE_MARKER_PREFIXES.get(str(operator))
+                    if marker and prefix and not str(marker).startswith(prefix):
+                        errors.append(f"{operator} marker has an invalid prefix: {rel}")
+                    if operation.get("changed") and (not marker or str(marker) not in text):
+                        errors.append(f"{operator} marker missing from source: {rel}")
                 except UnicodeDecodeError:
-                    warnings.append(f"mutated source is not UTF-8: {rel}")
-                operation_results.append({"operator": operation.get("operator"), "path": rel, "status": "checked"})
+                    if operation.get("changed"):
+                        warnings.append(f"mutated source is not UTF-8: {rel}")
+                operation_results.append({
+                    "operator": operator,
+                    "path": rel,
+                    "status": "checked" if operation.get("changed") else "skipped",
+                    "changed": bool(operation.get("changed")),
+                })
         elif operation.get("operator") == "source_mutation_skipped":
             operation_results.append(
                 {
@@ -334,10 +408,19 @@ def validate_manifest(manifest_path: Path, build: bool = False) -> Dict[str, Any
         else:
             operation_results.append({"operator": operation.get("operator"), "status": "recorded"})
 
+    for rel, expected_hash in source_hash_state.items():
+        path = variant_dir / rel
+        if path.exists() and sha256_file(path) != expected_hash:
+            errors.append(f"mutated source final hash mismatch: {rel}")
+
     syntax_results = []
+    syntax_paths = set()
     for operation in manifest.get("operations", []):
-        if operation.get("operator") == "opaque_guard_injection":
-            syntax_results.append(_syntax_check(variant_dir, operation["path"]))
+        if operation.get("operator") in _SOURCE_OPERATORS and operation.get("changed"):
+            source_path = operation.get("path")
+            if source_path and source_path not in syntax_paths:
+                syntax_paths.add(source_path)
+                syntax_results.append(_syntax_check(variant_dir, source_path))
     build_result = _build_check(
         variant_dir,
         list(manifest.get("seed_metadata", {}).get("declared_files", []) or []),
@@ -357,7 +440,9 @@ def validate_manifest(manifest_path: Path, build: bool = False) -> Dict[str, Any
     source_changed = sum(
         1
         for result in operation_results
-        if result.get("operator") == "opaque_guard_injection" and result.get("status") == "checked"
+        if result.get("operator") in _SOURCE_OPERATORS
+        and result.get("status") == "checked"
+        and result.get("changed")
     )
 
     return {

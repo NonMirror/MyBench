@@ -40,6 +40,27 @@
   “每道题都发生了实质变异”。`--build` 可选地在临时的完全脱离 hardlink 的副本中运行
   Makefile；默认不执行任意题目服务或 Docker，以保持批量生成稳定并避免污染种子。
 
+### 分析干扰策略
+
+源码变异默认加入四类与题目逻辑无关的分析干扰：`decoy_function_injection` 生成未被
+调用的无害函数，`dead_code_injection` 生成确定为假的局部路径，
+`duplicate_string_injection` 保留重复字符串常量，`irrelevant_syscall_injection` 在
+不可达 guard 内保留只读 `getpid` 调用。每个操作都记录策略、语言、marker 以及前后
+SHA-256；不支持的语言会记录 skipped，绝不会把注释或元数据当成变异。
+
+策略写入每个 `mutation_manifest.json`，并明确排除控制流平坦化、OLLVM 家族、packing
+和 shell loader。机器可读示例见 [`noise_policy.example.json`](noise_policy.example.json)
+和 [`noise_policy.schema.json`](noise_policy.schema.json)。可通过完整示例或内嵌
+`noise_policy` 对象传给 `generate`/`pipeline`：
+
+```bash
+uv run mybench pipeline --ctfbench ../CTFbench --output ./generated \
+  --category pwn rev --noise-policy ./noise_policy.example.json --clean
+```
+
+将某个 `limits` 项设为 `0` 会保留该 operator 的 skipped provenance。生成器只使用
+普通源码级构造，不实现控制流平坦化、虚拟化、加壳或壳加载器。
+
 ## 快速开始
 
 项目使用 `mise` 固定工具链、使用 `uv` 管理环境和 Python 命令。在 `MyBench/` 目录执行：

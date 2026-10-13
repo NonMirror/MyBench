@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mybench.invalid/schemas/noise-policy-v1.json",
+  "title": "MyBench noise policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "noise_policy"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "noise_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled_operators", "excluded_techniques"],
+      "properties": {
+        "enabled_operators": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "enum": [
+            "decoy_function_injection", "dead_code_injection",
+            "duplicate_string_injection", "irrelevant_syscall_injection"
+          ]}
+        },
+        "excluded_techniques": {
+          "type": "array", "uniqueItems": true,
+          "items": {"type": "string", "enum": [
+            "control_flow_flattening", "ollvm", "packing", "shell"
+          ]}
+        },
+        "limits": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "max_decoy_functions": {"type": "integer", "minimum": 0, "maximum": 32},
+            "max_dead_code_blocks": {"type": "integer", "minimum": 0, "maximum": 32},
+            "max_duplicate_strings": {"type": "integer", "minimum": 0, "maximum": 64},
+            "max_irrelevant_syscalls": {"type": "integer", "minimum": 0, "maximum": 16}
+          }
+        }
+      }
+    }
+  }
+}
