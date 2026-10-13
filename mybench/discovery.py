@@ -25,10 +25,20 @@ def _source_score(path: Path) -> tuple:
     name = path.name.lower()
     rel = "/".join(part.lower() for part in path.parts)
     score = 0
-    if name in {"main.c", "main.cpp", "main.cc", "challenge.c", "challenge.cpp", "chal.c", "chal.cpp"}:
+    if name in {
+        "main.c", "main.cc", "main.cpp", "main.cxx", "main.m", "main.mm",
+        "challenge.c", "challenge.cc", "challenge.cpp", "challenge.cxx",
+        "challenge.m", "challenge.mm", "chal.c", "chal.cc", "chal.cpp",
+        "chal.cxx", "chal.m", "chal.mm",
+    }:
         score += 100
-    if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".go", ".rs"}:
+    if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".go", ".rs", ".m", ".mm"}:
         score += 35
+    if path.suffix.lower() in {".h", ".hh", ".hpp", ".hxx"}:
+        # Headers are useful context but are not standalone runtime sources.
+        # Keep them discoverable when no implementation exists, while making
+        # an implementation file win when both are present.
+        score -= 80
     if any(part in rel for part in ("/src/", "/source/", "/src", "/source")):
         score += 20
     if any(token in name for token in ("challenge", "chall", "target", "program", "binary")):

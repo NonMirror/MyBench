@@ -6,23 +6,27 @@
 
 当前实现覆盖异构题目：
 
-- 有 C/C++、Go、Python、JavaScript/TypeScript 等源码的题目：对优先源码注入一个确定性的
-  opaque guard。guard 通过 `volatile` 读取和实际调用增加运行时控制流，但其确定性条件为假，
-  因此不会改变题目的正常输出；变异结果包含源码哈希和完整 provenance。
-- C/C++ 源码旁边如果存在同 basename 的已部署可执行文件，生成器会在隔离的构建过程中
-  重新编译该文件，并要求输出的格式和架构与 seed 一致；本机编译器不匹配时会尝试
-  `docker:gcc:12-bookworm` 的 `linux/amd64` 静态构建（再回退到动态构建）。只有
-  `compiled_artifact_rebuild` 成功且 hash、注入符号和 CFG witness 都通过，才把它计为
+- 有 C/C++/Objective-C、Go、Python、JavaScript/TypeScript、Rust 或 Java 源码的题目：对
+  优先源码注入一个确定性的 opaque guard。guard 使用语言对应的无副作用构造，正常执行路径
+  不改变题目输出；变异结果包含源码哈希和完整 provenance。
+- C/C++、Objective-C、Go 或 Rust 源码旁边如果存在同 basename 的已部署制品，生成器会在隔离的
+  构建过程中分别尝试 `gcc/g++`、`clang/clang++`、`go` 或 `rustc`，并要求输出格式和架构与
+  seed 一致。Java 只有在同 basename 的 `.class` 存在时才用匹配 class major version 的
+  `javac --release` 重建；Docker `gcc:12-bookworm` fallback 只用于 C/C++。只有
+  `compiled_artifact_rebuild` 成功且格式、hash、注入 marker 和 CFG witness 都通过，才把它计为
   可执行题目的实质变异。
 - 对只有预编译原生入口、无法从源码重建的题目，或只有原生插件/内核模块而没有可执行
   wrapper 的题目，生成器会分析 `main`/`entry0` 及其他用户函数，把一个
   同长度的 x86 条件跳转或 AArch64 条件跳转改成无条件跳转，并重新计算 CFG witness。
   这条 `binary_cfg_mutation` 路径直接修改变体中的实际 ELF/Mach-O/PE，保留 seed 不变；
   没有可安全改写的分支时只记录 `binary_cfg_mutation_skipped`，绝不把 wrapper 当成变异。
-- 不支持的源码语言、无法识别 C/C++ `main` 的源码以及没有候选源码的题目，会记录
-  `source_mutation_skipped` 和原因。它们不会被注释、模块变量或其他无效果标记冒充成已变异。
-- 如果源码不是声明的运行时文件、而且没有可兼容重建的已部署 artifact，源码修改会回滚并
-  记录为跳过；不会留下“源码变了、实际运行 binary 没变”的假变体。
+- 上述语言的源码注入器覆盖当前数据集中的语言样本；无法解析入口、源码不是候选文件或没有
+  候选源码时，仍会记录 `source_mutation_skipped` 和原因。它们不会被注释、模块变量或其他
+  无效果标记冒充成已变异。
+- 没有同 basename 部署制品的 source-only 题会保留源码级变异，并把 rebuild 记录为
+  `required: false`；有匹配制品但工具链、链接或依赖失败时，会回滚源码和 noise，避免留下
+  “源码变了、实际运行 binary 没变”的假变体。C/C++/Objective-C/Go/Rust/Java 的匹配制品
+  都遵守这一规则，回滚原因写入 manifest。
 - 只有预编译 ELF、脚本、压缩包或自定义 VM 的题目：生成可执行的
   `run_variant.sh` 入口包装，注入可复现的 variant/parent 环境标识，并记录降级路径。
 - `run_variant.sh` 和 `variant_runtime.json` 是运行时打包/元数据操作，不计作源码级的
@@ -42,11 +46,13 @@
 
 ### 分析干扰策略
 
-源码变异默认加入四类与题目逻辑无关的分析干扰：`decoy_function_injection` 生成未被
-调用的无害函数，`dead_code_injection` 生成确定为假的局部路径，
+源码变异默认加入四类与题目逻辑无关的分析干扰：`decoy_function_injection` 生成正常路径不
+调用的无害函数（Go 在 false guard 下保留引用，Rust 用 `black_box` 保留函数指针），
+`dead_code_injection` 生成确定为假的局部路径，
 `duplicate_string_injection` 保留重复字符串常量，`irrelevant_syscall_injection` 在
-不可达 guard 内保留只读 `getpid` 调用。每个操作都记录策略、语言、marker 以及前后
-SHA-256；不支持的语言会记录 skipped，绝不会把注释或元数据当成变异。
+不可达 guard 内保留只读进程 ID 调用（C/C++ 使用 `getpid`，脚本和 JVM/Go/Rust 使用其
+标准库等价接口）。四类操作现在支持 C/C++/Objective-C、Python、Go、Rust、Java 和 JS/TS；
+每个操作都记录策略、语言、marker 以及前后 SHA-256。
 
 策略写入每个 `mutation_manifest.json`，并明确排除控制流平坦化、OLLVM 家族、packing
 和 shell loader。机器可读示例见 [`noise_policy.example.json`](noise_policy.example.json)
@@ -63,98 +69,61 @@ uv run mybench pipeline --ctfbench ../CTFbench --output ./generated \
 
 ### 当前手法与样本覆盖
 
-下面的“生效”表示对应 operation 的 `changed: true`，并且变体中的实际源码或二进制
-经过了后置校验。样本名使用数据集的 `parent_id`；具体修改文件在该样本的
-`mutation_manifest.json` 中由 `path` 给出。
+下面的“生效”表示对应 operation 的 `changed: true`，并且变体中的源码或部署制品通过了后置校验。
+以下统计来自当前数据集的 110 个变体；每个样本的具体文件、哈希和跳过原因以
+`mutation_manifest.json` 为准。
 
-| operation | 实现条件 | 本次全量运行中生效的样本 |
+| operation | 实现条件 | 生效样本 |
 | --- | --- | --- |
-| `opaque_guard_injection` | 发现可解析的 C/C++、Go、Python 或 JS/TS 函数；guard 使用确定性 false 条件和 `volatile`，不改变正常输出。 | 25 个：`2014f-pwn-kernel`、`2016q-pwn-hungman`、`2016q-rev-rock`、`2017q-pwn-pilot`、`2017q-rev-prophecy`、`2017q-rev-realism`、`2017q-rev-tablez`、`2018f-rev-free_as_in_freedom`、`2018q-pwn-bigboy`、`2018q-pwn-shellpointcode`、`2018q-rev-a_walk_through_x86_part_1`、`2019q-rev-beleaf`、`2020q-pwn-thebardsfail`、`2020q-rev-baby_mult`、`2020q-rev-ezbreezy`、`2021q-pwn-haystack`、`2021q-pwn-krypto`、`2021q-rev-checker`、`2022q-rev-the_big_bang`、`2023q-pwn-my_first_pwnie`、`2023q-pwn-puffin`、`2023q-pwn-target_practice`、`2023q-rev-baby_s_first`、`2023q-rev-baby_s_third`、`2023q-rev-whataxor`。 |
-| `decoy_function_injection` | 只对 C/C++ 注入未调用的 `noinline`/`used` 辅助函数。 | 与另外三类源码干扰相同的 18 个：`2014f-pwn-kernel`、`2016q-pwn-hungman`、`2016q-rev-rock`、`2017q-pwn-pilot`、`2017q-rev-prophecy`、`2017q-rev-tablez`、`2018q-pwn-bigboy`、`2018q-pwn-shellpointcode`、`2019q-rev-beleaf`、`2020q-pwn-thebardsfail`、`2020q-rev-baby_mult`、`2020q-rev-ezbreezy`、`2021q-pwn-haystack`、`2021q-pwn-krypto`、`2023q-pwn-puffin`、`2023q-pwn-target_practice`、`2023q-rev-baby_s_third`、`2023q-rev-whataxor`。 |
-| `dead_code_injection` | 只对 C/C++ 注入由 `volatile` 计算保护的确定性 false 局部路径。 | 上述 18 个样本。 |
-| `duplicate_string_injection` | 只对 C/C++ 保留两份 `volatile` 重复字符串，并通过无关 helper 保持二进制可见。 | 上述 18 个样本。 |
-| `irrelevant_syscall_injection` | 只对 C/C++ 注入不可达 guard 内的只读 `getpid` 调用；结果不参与题目逻辑。 | 上述 18 个样本。 |
-| `compiled_artifact_rebuild` | 源文件为 C/C++，且存在同 basename 的已部署可执行文件；编译后格式、架构、哈希和 CFG witness 都必须匹配/变化。 | 16 个：`2016q-pwn-hungman`、`2016q-rev-rock`、`2017q-pwn-pilot`、`2017q-rev-prophecy`、`2017q-rev-tablez`、`2018q-pwn-bigboy`、`2018q-pwn-shellpointcode`、`2019q-rev-beleaf`、`2020q-pwn-thebardsfail`、`2020q-rev-baby_mult`、`2020q-rev-ezbreezy`、`2021q-pwn-haystack`、`2023q-pwn-puffin`、`2023q-pwn-target_practice`、`2023q-rev-baby_s_third`、`2023q-rev-whataxor`。 |
-| `binary_cfg_mutation` | 没有可用源码重建时，目标必须是 ELF/Mach-O/PE，radare2 能分析用户函数，并找到可保持指令长度的 x86/AArch64 条件跳转。 | 63 个；包括 `2013q-pwn-csaw_diary`、`2014q-pwn-ish`、`2014q-rev-aerosol_can`、`2015f-pwn-hipster`、`2015f-rev-wyvern2`、`2015q-pwn-meme_shop`、`2015q-rev-ftp`、`2015q-rev-wyvern`、`2016f-pwn-detective`、`2016f-rev-palo_alto`、`2016q-pwn-tutorial`、`2016q-pwn-warmup`、`2016q-rev-deedeedee`、`2017f-pwn-humm_sch_t`、`2017f-rev-48_bit_yeet_lab`、`2017f-rev-rabbithole`、`2017q-pwn-zone`、`2017q-rev-bananascript`、`2017q-rev-gopherz`、`2017q-rev-grumpcheck`、`2018f-pwn-es1337`、`2018f-rev-1nsayne`、`2018q-pwn-get_it`、`2018q-rev-kvm`、`2019f-pwn-arevenge`、`2019f-rev-steady_counting`、`2019f-rev-wrangly`、`2019q-pwn-baby_boi`、`2019q-pwn-got_milk`、`2019q-pwn-pop_goes_the_printer`、`2019q-pwn-popping_caps`、`2019q-pwn-popping_caps_2`、`2019q-pwn-traveller`、`2019q-rev-call_site`、`2019q-rev-gibberish_check`、`2019q-rev-wizkid`、`2020f-rev-brrr`、`2020f-rev-rap`、`2020f-rev-yeet`、`2020q-pwn-blox2`、`2020q-pwn-feather`、`2020q-pwn-grid`、`2020q-pwn-roppity`、`2020q-rev-not_malware`、`2021f-pwn-chatterbox`、`2021f-pwn-horrorscope`、`2021f-rev-maze`、`2021q-pwn-alien_math`、`2021q-pwn-password_checker`、`2021q-rev-ransomware`、`2022f-pwn-salt_server`、`2022f-rev-parallel_vm`、`2022q-pwn-unsafe_linking`、`2022q-rev-game`、`2023f-rev-unvirtualization`、`2023f-rev-virtualization`、`2023q-pwn-unlimited_subway`、`2023q-rev-rebug_1`、`2023q-rev-rebug_2`、`2023q-rev-rox`；完整清单以 manifest 为准。 |
+| `opaque_guard_injection` | 在 C/C++/Objective-C、Python、Go、Rust、Java、JS/TS 的可解析入口加入确定性 false guard。 | 39 个：C/Objective-C 16 个（`2014f-pwn-kernel`、`2016q-pwn-hungman`、`2017q-rev-tablez`、`2018q-pwn-bigboy`、`2018q-pwn-shellpointcode`、`2019q-pwn-pop_goes_the_printer`、`2019q-rev-beleaf`、`2020q-pwn-thebardsfail`、`2020q-rev-baby_mult`、`2020q-rev-ezbreezy`、`2021q-pwn-haystack`、`2021q-pwn-krypto`、`2023q-pwn-puffin`、`2023q-pwn-target_practice`、`2023q-rev-baby_s_third`、`2023q-rev-whataxor`），C++ 3 个（`2016q-rev-rock`、`2017q-pwn-pilot`、`2017q-rev-prophecy`），Python 14 个（`2017q-rev-grumpcheck`、`2017q-rev-realism`、`2018f-rev-bdos`、`2018f-rev-free_as_in_freedom`、`2018q-rev-a_walk_through_x86_part_1`、`2020q-pwn-slithery`、`2021f-rev-maze`、`2021f-rev-sfc`、`2021q-rev-checker`、`2021q-rev-ncore`、`2022q-rev-anyagacha`、`2022q-rev-the_big_bang`、`2023q-pwn-my_first_pwnie`、`2023q-rev-baby_s_first`），Go 3 个（`2017q-rev-gopherz`、`2018f-pwn-es1337`、`2021q-rev-macomal`），Rust 2 个（`2017f-rev-rusty_road`、`2020f-rev-yeet`），Java 1 个（`2022f-rev-roulette`）。 |
+| `decoy_function_injection` | 支持 C/C++/Objective-C、Python、Go、Rust、Java、JS/TS；注入未调用的无害函数或方法，并保留 marker/hash provenance。 | 39 个：`2014f-pwn-kernel`、`2016q-pwn-hungman`、`2016q-rev-rock`、`2017q-pwn-pilot`、`2017q-rev-prophecy`、`2017q-rev-tablez`、`2018q-pwn-bigboy`、`2018q-pwn-shellpointcode`、`2019q-pwn-pop_goes_the_printer`、`2019q-rev-beleaf`、`2020q-pwn-thebardsfail`、`2020q-rev-baby_mult`、`2020q-rev-ezbreezy`、`2021q-pwn-haystack`、`2021q-pwn-krypto`、`2023q-pwn-puffin`、`2023q-pwn-target_practice`、`2023q-rev-baby_s_third`、`2023q-rev-whataxor`、`2017q-rev-grumpcheck`、`2017q-rev-realism`、`2018f-rev-bdos`、`2018f-rev-free_as_in_freedom`、`2018q-rev-a_walk_through_x86_part_1`、`2020q-pwn-slithery`、`2021f-rev-maze`、`2021f-rev-sfc`、`2021q-rev-checker`、`2021q-rev-ncore`、`2022q-rev-anyagacha`、`2022q-rev-the_big_bang`、`2023q-pwn-my_first_pwnie`、`2023q-rev-baby_s_first`、`2017q-rev-gopherz`、`2018f-pwn-es1337`、`2021q-rev-macomal`、`2017f-rev-rusty_road`、`2020f-rev-yeet`、`2022f-rev-roulette`。语言分组为 C/Objective-C 16、C++ 3、Python 14、Go 3、Rust 2、Java 1。 |
+| `dead_code_injection` | 在支持语言中加入由确定性 false 条件保护的局部路径；不会改变题目正常输出。 | 与 `decoy_function_injection` 相同的 39 个样本。 |
+| `duplicate_string_injection` | 在支持语言中保留重复字符串字面量，并通过无关 helper 保持其在源码/产物中可见。 | 与 `decoy_function_injection` 相同的 39 个样本。 |
+| `irrelevant_syscall_injection` | 在不可达 guard 中加入只读进程 ID 调用（C/Go/Python/JS 等使用对应平台 API；Rust/Java 使用对应标准库），结果不参与题目逻辑。 | 与 `decoy_function_injection` 相同的 39 个样本。 |
+| `compiled_artifact_rebuild` | 对同 basename 的本地制品重建；校验格式、架构、哈希、所有注入 marker 和 CFG witness。 | 18 个：`2016q-pwn-hungman`、`2016q-rev-rock`、`2017f-rev-rusty_road`、`2017q-pwn-pilot`、`2017q-rev-prophecy`、`2017q-rev-tablez`、`2018q-pwn-bigboy`、`2018q-pwn-shellpointcode`、`2019q-rev-beleaf`、`2020q-pwn-thebardsfail`、`2020q-rev-baby_mult`、`2020q-rev-ezbreezy`、`2021q-pwn-haystack`、`2022f-rev-roulette`、`2023q-pwn-puffin`、`2023q-pwn-target_practice`、`2023q-rev-baby_s_third`、`2023q-rev-whataxor`。 |
+| `binary_cfg_mutation` | 没有可用源码重建时，目标必须是 ELF/Mach-O/PE，且 radare2 找到可保持指令长度的条件跳转。 | 62 个：`2013q-pwn-csaw_diary`、`2014q-pwn-ish`、`2014q-pwn-the_road_less_traveled`、`2014q-rev-aerosol_can`、`2015f-pwn-hipster`、`2015f-rev-wyvern2`、`2015q-pwn-meme_shop`、`2015q-rev-ftp`、`2015q-rev-wyvern`、`2016f-pwn-detective`、`2016f-rev-palo_alto`、`2016q-pwn-tutorial`、`2016q-pwn-warmup`、`2016q-rev-deedeedee`、`2017f-pwn-humm_sch_t`、`2017f-rev-48_bit_yeet_lab`、`2017f-rev-rabbithole`、`2017q-pwn-zone`、`2017q-rev-bananascript`、`2017q-rev-gopherz`、`2017q-rev-grumpcheck`、`2018f-pwn-es1337`、`2018f-rev-1nsayne`、`2018q-pwn-get_it`、`2018q-rev-kvm`、`2019f-pwn-arevenge`、`2019f-rev-steady_counting`、`2019f-rev-wrangly`、`2019q-pwn-baby_boi`、`2019q-pwn-got_milk`、`2019q-pwn-pop_goes_the_printer`、`2019q-pwn-popping_caps`、`2019q-pwn-popping_caps_2`、`2019q-pwn-traveller`、`2019q-rev-call_site`、`2019q-rev-gibberish_check`、`2019q-rev-wizkid`、`2020f-rev-brrr`、`2020f-rev-rap`、`2020f-rev-yeet`、`2020q-pwn-blox2`、`2020q-pwn-feather`、`2020q-pwn-grid`、`2020q-pwn-roppity`、`2020q-rev-not_malware`、`2021f-pwn-chatterbox`、`2021f-pwn-horrorscope`、`2021f-rev-maze`、`2021q-pwn-alien_math`、`2021q-pwn-password_checker`、`2021q-rev-ransomware`、`2022f-pwn-salt_server`、`2022f-rev-parallel_vm`、`2022q-pwn-unsafe_linking`、`2022q-rev-game`、`2023f-pwn-virtualization_pwn`、`2023f-rev-unvirtualization`、`2023f-rev-virtualization`、`2023q-pwn-unlimited_subway`、`2023q-rev-rebug_1`、`2023q-rev-rebug_2`、`2023q-rev-rox`。 |
 
-`runtime_entrypoint_wrapper`（96 个）和 `runtime_metadata_overlay`（14 个）是运行时
-打包降级，不属于 pwn/rev 实质变异：前者只是把原入口放到 `run_variant.sh` 并设置
-变体环境变量，后者只写入 `variant_runtime.json`。它们不能替代源码或二进制变异。
+`runtime_entrypoint_wrapper`（96 个）和 `runtime_metadata_overlay`（14 个）只负责打包入口和注入环境标识，不计作源码或二进制实质变异。
+上表按当前工具链的全量报告统计；`2022f-rev-roulette` 只有在 `chall.class` 存在且
+`javac --release` 重建成功时才进入清单。若该匹配制品的编译失败，源码和四类 noise 会一起
+回滚；没有匹配制品的 Java 题则保留 source-only 变异。
 
 ### 为什么其它样本被跳过
 
-跳过是按前置条件逐项记录的，不会把失败编译、未知格式或没有可证明 CFG 变化的情况
-伪装成成功。当前全量运行的原因如下：
+现在没有样本因为 Python、Go、Rust 或 Java 注入器缺失而跳过。全量中每个源码样本的四类 noise 都先完成语言级注入；最终仍为 `changed: false` 的四类 noise 各有 48 个，原因都是 C/C++ 制品重建失败后恢复源码，避免留下“源码变了、实际运行 binary 没变”的假变体。这 48 个是：
 
-- 四类源码分析干扰各有 69 个 skipped。11 个是语言/文件类型不在 C/C++ 注入器范围：
-  `.py` 的 `2017q-rev-realism`、`2018f-rev-free_as_in_freedom`、
-  `2018q-rev-a_walk_through_x86_part_1`、`2021q-rev-checker`、`2022q-rev-the_big_bang`、
-  `2023q-pwn-my_first_pwnie`、`2023q-rev-baby_s_first`；`.rs` 的
-  `2017f-rev-rusty_road`、`2020f-rev-yeet`；`.h` 的 `2019q-pwn-pop_goes_the_printer`；
-  `.java` 的 `2022f-rev-roulette`。其余 58 个虽然发现了可处理的源码，但兼容的部署
-  artifact 重建失败，生成器因此恢复原源码，避免“源码变了、实际运行文件没变”。这
-  58 个按 manifest 的底层原因分为：33 个没有同 basename 可执行文件，10 个源码重建
-  本身不支持（Python 7、Go 3），8 个旧 API/隐式声明被编译器拒绝，1 个架构/格式不匹配，
-  1 个 C++17 要求，1 个 `_start` 链接冲突，1 个普通编译失败，1 个依赖链接失败，
-  1 个缺少 KVM guest 对象，1 个内联汇编不兼容。
-- `opaque_guard_injection` 的其它样本是 23 个没有候选源码的预编译题、上述 58 个因
-  部署 artifact 重建失败而恢复源码的样本，以及 `.h`/`.rs`/`.java` 文件；没有函数
-  定义可安全插入时只记录 `source_mutation_skipped`。
+`2014q-pwn-the_road_less_traveled`、`2015q-pwn-meme_shop`、`2016f-pwn-detective`、`2016q-pwn-tutorial`、`2016q-pwn-warmup`、`2017f-rev-48_bit_yeet_lab`、`2017f-rev-rabbithole`、`2017q-pwn-zone`、`2018q-pwn-get_it`、`2018q-rev-kvm`、`2019f-pwn-arevenge`、`2019f-rev-mystery_boi`、`2019f-rev-wrangly`、`2019q-pwn-baby_boi`、`2019q-pwn-got_milk`、`2019q-pwn-popping_caps`、`2019q-pwn-popping_caps_2`、`2019q-pwn-small_boi`、`2019q-pwn-traveller`、`2019q-rev-call_site`、`2019q-rev-gibberish_check`、`2019q-rev-halfpike`、`2020f-pwn-darkunion1`、`2020f-rev-brrr`、`2020f-rev-rap`、`2020q-pwn-feather`、`2020q-pwn-grid`、`2020q-pwn-roppity`、`2020q-rev-not_malware`、`2021f-pwn-chatterbox`、`2021f-pwn-horrorscope`、`2021q-pwn-alien_math`、`2021q-pwn-password_checker`、`2021q-rev-ransomware`、`2022f-pwn-cryptopwn`、`2022f-pwn-salt_server`、`2022f-rev-parallel_vm`、`2022q-pwn-ezrop`、`2022q-pwn-unsafe_linking`、`2022q-rev-game`、`2023f-pwn-brainflop`、`2023f-pwn-virtualization_pwn`、`2023f-rev-cell`、`2023f-rev-virtualization`、`2023q-pwn-unlimited_subway`、`2023q-rev-rebug_1`、`2023q-rev-rebug_2`、`2023q-rev-rox`。
 
-其中 23 个没有候选源码的样本是：`2013q-pwn-csaw_diary`、`2014f-rev-odd`、
-`2014f-rev-return_of_the_weiner`、`2014q-pwn-ish`、`2014q-rev-aerosol_can`、
-`2014q-rev-weissman`、`2015f-pwn-hipster`、`2015f-rev-wyvern2`、
-`2015q-rev-ftp`、`2015q-rev-wyvern`、`2016f-rev-palo_alto`、`2016q-rev-deedeedee`、
-`2017f-pwn-humm_sch_t`、`2017q-rev-bananascript`、`2018f-rev-1nsayne`、
-`2018q-rev-a_walk_through_x86_part_2`、`2019f-rev-steady_counting`、
-`2019q-rev-wizkid`、`2020f-rev-sourcery`、`2020q-pwn-blox2`、`2020q-pwn-pwnvoltex`、
-`2022q-rev-dockreleakage`、`2023f-rev-unvirtualization`。这些题目只有预编译入口、
-数据或非候选源码，生成器无法证明源码注入会进入实际运行路径。
-- `compiled_artifact_rebuild` 的 67 个 skipped 中，35 个没有与源码同 basename 的已部署
-  可执行文件，不能证明源码会进入运行路径；17 个是 Go/Python 等不在自动 C/C++ 重建
-  范围内（`.py` 14 个、`.go` 3 个）；其余 15 个因编译器/链接器、架构或语言标准
-  不兼容而失败（例如 32 位共享对象与本机 64 位输出不匹配、`gets`/`setgroups` 等
-  旧 API、手写 `_start`、缺少 KVM 依赖、C++17 要求或内联汇编不兼容）。这些题目不会
-  留下 source-only 变体。
-- `binary_cfg_mutation` 的 22 个 skipped 中，18 个入口不是支持的原生 ELF/Mach-O/PE，
-  2 个没有可保持长度的条件跳转（`2019q-pwn-small_boi`、`2022q-rev-anyagacha`），
-  2 个 radare2 无法分析 `main`/`entry0`（`2014f-rev-odd`、`2021q-rev-macomal`）。
-  wrapper 本身从不作为 CFG 变异目标。
+`opaque_guard_injection` 另外有 23 个 skipped，因为没有候选源码：`2013q-pwn-csaw_diary`、`2014f-rev-odd`、`2014f-rev-return_of_the_weiner`、`2014q-pwn-ish`、`2014q-rev-aerosol_can`、`2014q-rev-weissman`、`2015f-pwn-hipster`、`2015f-rev-wyvern2`、`2015q-rev-ftp`、`2015q-rev-wyvern`、`2016f-rev-palo_alto`、`2016q-rev-deedeedee`、`2017f-pwn-humm_sch_t`、`2017q-rev-bananascript`、`2018f-rev-1nsayne`、`2018q-rev-a_walk_through_x86_part_2`、`2019f-rev-steady_counting`、`2019q-rev-wizkid`、`2020f-rev-sourcery`、`2020q-pwn-blox2`、`2020q-pwn-pwnvoltex`、`2022q-rev-dockreleakage`、`2023f-rev-unvirtualization`。这些题只有预编译入口、数据或非候选源码，源码注入无法证明会进入运行路径。
 
-为便于复核，二进制路径中 18 个非原生入口是：
-`2017q-rev-realism`、`2018f-rev-free_as_in_freedom`、
-`2018q-rev-a_walk_through_x86_part_1`、`2018q-rev-a_walk_through_x86_part_2`、
-`2019f-rev-mystery_boi`、`2020f-pwn-darkunion1`、`2020q-pwn-slithery`、
-`2021f-rev-sfc`、`2021q-pwn-krypto`、`2021q-rev-checker`、
-`2021q-rev-ncore`、`2022f-pwn-cryptopwn`、`2022q-pwn-ezrop`、
-`2022q-rev-the_big_bang`、`2023f-pwn-brainflop`、`2023f-rev-cell`、
-`2023q-pwn-my_first_pwnie`、`2023q-rev-baby_s_first`。它们的入口是脚本、数据、
-压缩内容或其它非原生载荷，不能安全套用原生指令补丁。
+`compiled_artifact_rebuild` 的 69 个 skipped 分成三类。40 个没有和源码同 basename 的本地制品，
+所以保留 source-authoritative 变异：`2014f-pwn-kernel`、`2014q-pwn-the_road_less_traveled`、
+`2015q-pwn-meme_shop`、`2017f-rev-rabbithole`、`2017q-pwn-zone`、`2017q-rev-gopherz`、
+`2018f-pwn-es1337`、`2019f-pwn-arevenge`、`2019f-rev-mystery_boi`、`2019q-pwn-got_milk`、
+`2019q-pwn-pop_goes_the_printer`、`2019q-pwn-popping_caps`、`2019q-pwn-popping_caps_2`、
+`2019q-pwn-traveller`、`2019q-rev-call_site`、`2019q-rev-halfpike`、`2020f-pwn-darkunion1`、
+`2020f-rev-brrr`、`2020f-rev-rap`、`2020f-rev-yeet`、`2020q-pwn-grid`、`2020q-rev-not_malware`、
+`2021f-pwn-chatterbox`、`2021f-pwn-horrorscope`、`2021q-pwn-krypto`、`2021q-rev-macomal`、
+`2021q-rev-ransomware`、`2022f-pwn-cryptopwn`、`2022f-pwn-salt_server`、`2022f-rev-parallel_vm`、
+`2022q-pwn-ezrop`、`2022q-pwn-unsafe_linking`、`2023f-pwn-brainflop`、`2023f-pwn-virtualization_pwn`、
+`2023f-rev-cell`、`2023f-rev-virtualization`、`2023q-pwn-unlimited_subway`、`2023q-rev-rebug_1`、
+`2023q-rev-rebug_2`、`2023q-rev-rox`。其中 `2019q-pwn-pop_goes_the_printer` 的 Objective-C
+源码仍然有效，跳过的只是没有同名部署制品。
+另有 14 个 source-only 样本没有部署制品：`2017q-rev-grumpcheck`、`2017q-rev-realism`、
+`2018f-rev-bdos`、`2018f-rev-free_as_in_freedom`、`2018q-rev-a_walk_through_x86_part_1`、
+`2020q-pwn-slithery`、`2021f-rev-maze`、`2021f-rev-sfc`、`2021q-rev-checker`、
+`2021q-rev-ncore`、`2022q-rev-anyagacha`、`2022q-rev-the_big_bang`、
+`2023q-pwn-my_first_pwnie`、`2023q-rev-baby_s_first`。最后 15 个存在匹配制品但编译、链接、架构
+或依赖不兼容：`2016f-pwn-detective`、`2016q-pwn-tutorial`、`2016q-pwn-warmup`、
+`2017f-rev-48_bit_yeet_lab`、`2018q-pwn-get_it`、`2018q-rev-kvm`、`2019f-rev-wrangly`、
+`2019q-pwn-baby_boi`、`2019q-pwn-small_boi`、`2019q-rev-gibberish_check`、`2020q-pwn-feather`、
+`2020q-pwn-roppity`、`2021q-pwn-alien_math`、`2021q-pwn-password_checker`、`2022q-rev-game`。
+失败原因包括旧汇编语法、缺失外部符号、旧式 `gets`/系统 API、C++ 标准版本、重复 `_start`
+以及题目自带依赖；这些不是语言注入器跳过，manifest 会保存编译器尾部输出。
 
-源码干扰因“重建失败后恢复源码”而跳过的 58 个样本为：
-`2014q-pwn-the_road_less_traveled`、`2015q-pwn-meme_shop`、`2016f-pwn-detective`、
-`2016q-pwn-tutorial`、`2016q-pwn-warmup`、`2017f-rev-48_bit_yeet_lab`、
-`2017f-rev-rabbithole`、`2017q-pwn-zone`、`2017q-rev-gopherz`、
-`2017q-rev-grumpcheck`、`2018f-pwn-es1337`、`2018f-rev-bdos`、`2018q-pwn-get_it`、
-`2018q-rev-kvm`、`2019f-pwn-arevenge`、`2019f-rev-mystery_boi`、`2019f-rev-wrangly`、
-`2019q-pwn-baby_boi`、`2019q-pwn-got_milk`、`2019q-pwn-popping_caps`、
-`2019q-pwn-popping_caps_2`、`2019q-pwn-small_boi`、`2019q-pwn-traveller`、
-`2019q-rev-call_site`、`2019q-rev-gibberish_check`、`2019q-rev-halfpike`、
-`2020f-pwn-darkunion1`、`2020f-rev-brrr`、`2020f-rev-rap`、`2020q-pwn-feather`、
-`2020q-pwn-grid`、`2020q-pwn-roppity`、`2020q-rev-not_malware`、
-`2021f-pwn-chatterbox`、`2021f-pwn-horrorscope`、`2021f-rev-maze`、
-`2021f-rev-sfc`、`2021q-pwn-alien_math`、`2021q-pwn-password_checker`、
-`2021q-rev-macomal`、`2021q-rev-ncore`、`2021q-rev-ransomware`、
-`2022f-pwn-cryptopwn`、`2022f-pwn-salt_server`、`2022f-rev-parallel_vm`、
-`2022q-pwn-ezrop`、`2022q-pwn-unsafe_linking`、`2022q-rev-anyagacha`、
-`2022q-rev-game`、`2023f-pwn-brainflop`、`2023f-pwn-virtualization_pwn`、
-`2023f-rev-cell`、`2023f-rev-virtualization`、`2023q-pwn-unlimited_subway`、
-`2023q-rev-rebug_1`、`2023q-rev-rebug_2`、`2023q-rev-rox`。具体编译器输出、格式
-不匹配或缺少依赖的细节保存在各自 manifest 的 `reason` 字段中。
+`binary_cfg_mutation` 的 22 个 skipped 中，18 个入口不是 ELF/Mach-O/PE，分别是脚本、数据、压缩内容或其它非原生载荷；`2019q-pwn-small_boi` 和 `2022q-rev-anyagacha` 没有可保持指令长度的条件跳转；`2014f-rev-odd` 和 `2021q-rev-macomal` 无法由 radare2 分析 `main`/`entry0`。wrapper 本身从不作为 CFG 变异目标。
 
-因此，“跳过”表示当前实现无法同时证明语义保持、实际运行路径和变异可验证性；要覆盖
-这些样本，需要增加对应语言的源码注入器、目标工具链/交叉编译器，或针对其二进制格式
-的专用分析器，而不是放宽现有校验。
+因此，当前“语言导致的跳过”已经消除；剩余 skipped 只对应没有源码、没有可映射部署制品、工具链/依赖失败或无法证明二进制 CFG 变化，并在 manifest 中保留具体原因。
 
 ## 快速开始
 
@@ -193,8 +162,8 @@ uv run mybench pipeline \
   `variant_runtime.json`（没有安全入口时）。
 
 基于当前仓库的全量运行（pwn 49、rev 61，共 110 个变体），验证结果为 110/110
-通过；其中 79 个变体发生了部署制品级变异（`compiled_artifact_rebuild` 16 个、
-`binary_cfg_mutation` 63 个），25 个变体完成了 `opaque_guard_injection`，18 个变体
+通过；其中 80 个变体发生了部署制品级变异（`compiled_artifact_rebuild` 18 个、
+`binary_cfg_mutation` 62 个），39 个变体完成了 `opaque_guard_injection`，39 个变体
 完成了四类源码分析干扰。源码干扰和部署制品变异可以重叠；skipped 只表示对应操作的
 前置条件不满足，不表示变体验证失败。下面的样本清单来自同一批
 `mutation_manifest.json`，重新生成数据集后应以 manifest 中的实际清单为准。

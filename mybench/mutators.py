@@ -196,54 +196,357 @@ def _noise_skip(source: Path, relative_path: Path, operator: str, reason: str) -
     }
 
 
-def _inject_c_noise(source: Path, relative_path: Path, variant_id: str, operator: str) -> Dict[str, Any]:
-    before_hash = sha256_file(source)
-    suffix = source.suffix.lower()
-    if suffix not in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}:
-        return _noise_skip(source, relative_path, operator, f"source noise supports C/C++ only, got {suffix or '<none>'}")
-    try:
-        content = source.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return _noise_skip(source, relative_path, operator, "source is not valid UTF-8")
-    function_match = _c_function_match(content)
-    if function_match is None:
-        return _noise_skip(source, relative_path, operator, "no compatible C/C++ function definition found")
-    tag = hashlib.sha256((variant_id + ":" + operator).encode()).hexdigest()[:16]
-    if operator == "decoy_function_injection":
-        marker = _noise_identifier(DECOY_FUNCTION_PREFIX, variant_id)
-        helper = f"\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static unsigned long long {marker}(unsigned long long seed) {{\n#else\nstatic unsigned long long {marker}(unsigned long long seed) {{\n#endif\n    volatile unsigned long long state = seed ^ 0x{tag}ULL;\n    return state + 0x{tag}ULL;\n}}\n"
-        body = "\n"
-        strategy = "noinline_unused_decoy_function"
-    elif operator == "dead_code_injection":
-        marker = _noise_identifier(DEAD_CODE_PREFIX, variant_id)
-        helper = f"\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static int {marker}(void) {{\n#else\nstatic int {marker}(void) {{\n#endif\n    volatile unsigned long long state = 0x{tag}ULL;\n    return (state ^ 0x{tag}ULL) == 1ULL;\n}}\n"
-        body = f"\n    if ({marker}()) {{\n        volatile unsigned long long mybench_dead_sink = 0x{tag}ULL;\n        mybench_dead_sink ^= 0x{tag}ULL;\n        (void)mybench_dead_sink;\n    }}\n"
-        strategy = "volatile_false_branch"
-    elif operator == "duplicate_string_injection":
-        marker = _noise_identifier(DUPLICATE_STRING_PREFIX, variant_id)
-        a, b = marker + "_a", marker + "_b"
-        helper = f'\nstatic volatile const char {a}[] = "mybench decoy diagnostic {tag}";\nstatic volatile const char {b}[] = "mybench decoy diagnostic {tag}";\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static unsigned long long {marker}(void) {{\n#else\nstatic unsigned long long {marker}(void) {{\n#endif\n    return (unsigned char){a}[0] ^ (unsigned char){b}[0];\n}}\n'
-        body = f"\n    {{\n        volatile unsigned long long mybench_duplicate_sink = {marker}();\n        (void)mybench_duplicate_sink;\n    }}\n"
-        strategy = "volatile_duplicate_literals"
-    elif operator == "irrelevant_syscall_injection":
-        marker = _noise_identifier(IRRELEVANT_SYSCALL_PREFIX, variant_id)
-        helper = f"\n#if defined(__unix__) || defined(__APPLE__)\n#include <unistd.h>\n#endif\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static long {marker}(void) {{\n#else\nstatic long {marker}(void) {{\n#endif\n#if defined(__unix__) || defined(__APPLE__)\n    return (long)getpid();\n#else\n    return 0L;\n#endif\n}}\n"
-        body = f"\n    {{\n        volatile unsigned long long mybench_syscall_gate = 0x{tag}ULL;\n        if ((mybench_syscall_gate ^ 0x{tag}ULL) == 1ULL) {{\n            volatile long mybench_syscall_sink = {marker}();\n            (void)mybench_syscall_sink;\n        }}\n    }}\n"
-        strategy = "guarded_getpid_read_only"
-    else:
-        raise ValueError(f"unknown source noise operator: {operator}")
-    insert_at = function_match.end()
-    _replace_file(source, helper + content[:insert_at] + body + content[insert_at:])
+def _append_noise_operation(
+    source: Path,
+    relative_path: Path,
+    operator: str,
+    before_hash: str,
+    marker: str,
+    strategy: str,
+    content: str,
+) -> Dict[str, Any]:
+    """Write a language-specific noise fragment and return provenance.
+
+    Source noise is intentionally kept separate from the opaque guard.  The
+    fragment must be visible in the deployed source, but it must not depend on
+    a challenge-specific entry point or alter its normal output.
+    """
+    _replace_file(source, content)
+    after_hash = sha256_file(source)
     return {
         "operator": operator,
         "strategy": strategy,
         "language": _noise_language(source),
         "path": relative_path.as_posix(),
         "before_sha256": before_hash,
-        "after_sha256": sha256_file(source),
+        "after_sha256": after_hash,
         "marker": marker,
-        "changed": before_hash != sha256_file(source),
+        "changed": before_hash != after_hash,
     }
+
+
+def _go_tokens(content: str) -> List[re.Match[str]]:
+    """Tokenize enough Go syntax to edit imports without matching comments."""
+    pattern = r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|`[^`]*`|\'(?:\\.|[^\'\\])*\'|[A-Za-z_]\w*|[^\s]'
+    return [token for token in re.finditer(pattern, content)
+            if not token.group().startswith(("//", "/*"))]
+
+
+def _go_os_import(content: str) -> Optional[tuple[str, int, int]]:
+    """Return the os import binding and alias span for all valid import forms."""
+    tokens = _go_tokens(content)
+    index = 0
+    while index < len(tokens):
+        if tokens[index].group() != "import":
+            index += 1
+            continue
+        index += 1
+        grouped = index < len(tokens) and tokens[index].group() == "("
+        if grouped:
+            index += 1
+        while index < len(tokens) and tokens[index].group() != ")":
+            if tokens[index].group() == ";":
+                index += 1
+                continue
+            token = tokens[index]
+            binding = "os"
+            alias_start = alias_end = token.start()
+            if not token.group().startswith(('"', "`")):
+                binding = token.group()
+                alias_start, alias_end = token.span()
+                index += 1
+                if index >= len(tokens):
+                    break
+                token = tokens[index]
+            if token.group() in {'"os"', '`os`'}:
+                return binding, alias_start, alias_end
+            index += 1
+            if not grouped:
+                break
+    return None
+
+
+def _ensure_go_os_import(content: str) -> str:
+    """Reuse os aliases and preserve the preamble attached to import C."""
+    existing = _go_os_import(content)
+    if existing is not None and existing[0] != "_":
+        return content
+    identifiers = {token.group() for token in _go_tokens(content)}
+    binding = "os"
+    while binding in identifiers:
+        binding = "mybench_" + binding
+    if existing is not None:
+        # A blank import already initializes os; bind that same import rather
+        # than add a duplicate path.  It was deliberately unused by the seed.
+        _, start, end = existing
+        return content[:start] + binding + content[end:]
+    tokens = _go_tokens(content)
+    package_token = next((i for i, token in enumerate(tokens) if token.group() == "package"), None)
+    if package_token is None or package_token + 1 >= len(tokens):
+        raise ValueError("no Go package declaration found")
+    insert_at = tokens[package_token + 1].end()
+    # Insert before all original imports, never inside their comment blocks:
+    # cgo's preamble must remain immediately adjacent to import "C".
+    declaration = 'import "os"' if binding == "os" else f'import {binding} "os"'
+    return content[:insert_at] + "\n\n" + declaration + "\n" + content[insert_at:]
+
+
+def _java_code_mask(content: str) -> str:
+    """Hide comments and literals while preserving offsets and real braces."""
+    token = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
+    return token.sub(lambda match: re.sub(r"[^\n]", " ", match.group()), content)
+
+
+def _java_class_bounds(content: str, source_name: str) -> Optional[tuple[int, int, Optional[int]]]:
+    """Find the source-named top-level class and its direct main method."""
+    code = _java_code_mask(content)
+    depth = 0
+    depths = []
+    closing_braces: Dict[int, int] = {}
+    stack: List[int] = []
+    for offset, char in enumerate(code):
+        depths.append(depth)
+        if char == "{":
+            stack.append(offset)
+            depth += 1
+        elif char == "}":
+            if not stack:
+                return None
+            closing_braces[stack.pop()] = offset
+            depth -= 1
+    if stack:
+        return None
+    candidates = []
+    for match in re.finditer(r"\bclass\s+([A-Za-z_$][\w$]*)\b[^;{}]*\{", code):
+        start = match.end() - 1
+        if depths[match.start()] != 0 or start not in closing_braces:
+            continue
+        end = closing_braces[start]
+        main = None
+        for method in re.finditer(r"\bstatic\s+(?:final\s+)?void\s+main\s*\([^{};]*\)\s*(?:throws\s+[^{};]+)?\{", code[start + 1:end]):
+            method_start = start + 1 + method.start()
+            if depths[method_start] == 1:
+                main = start + 1 + method.end()
+                break
+        candidates.append((match.group(1), start, end, main))
+    selected = next((candidate for candidate in candidates if candidate[0] == source_name), None)
+    if selected is None:
+        with_main = [candidate for candidate in candidates if candidate[3] is not None]
+        if len(with_main) == 1:
+            selected = with_main[0]
+        elif len(candidates) == 1:
+            selected = candidates[0]
+    return (selected[1], selected[2], selected[3]) if selected else None
+
+
+def _inject_source_noise(source: Path, relative_path: Path, variant_id: str, operator: str) -> Dict[str, Any]:
+    before_hash = sha256_file(source)
+    suffix = source.suffix.lower()
+    try:
+        content = source.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return _noise_skip(source, relative_path, operator, "source is not valid UTF-8")
+    tag = hashlib.sha256((variant_id + ":" + operator).encode()).hexdigest()[:16]
+    if suffix in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}:
+        function_match = _c_function_match(content)
+        if function_match is None:
+            return _noise_skip(source, relative_path, operator, "no compatible C/C++ function definition found")
+        if operator == "decoy_function_injection":
+            marker = _noise_identifier(DECOY_FUNCTION_PREFIX, variant_id)
+            helper = f"\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static unsigned long long {marker}(unsigned long long seed) {{\n#else\nstatic unsigned long long {marker}(unsigned long long seed) {{\n#endif\n    volatile unsigned long long state = seed ^ 0x{tag}ULL;\n    return state + 0x{tag}ULL;\n}}\n"
+            body = "\n"
+            strategy = "noinline_unused_decoy_function"
+        elif operator == "dead_code_injection":
+            marker = _noise_identifier(DEAD_CODE_PREFIX, variant_id)
+            helper = f"\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static int {marker}(void) {{\n#else\nstatic int {marker}(void) {{\n#endif\n    volatile unsigned long long state = 0x{tag}ULL;\n    return (state ^ 0x{tag}ULL) == 1ULL;\n}}\n"
+            body = f"\n    if ({marker}()) {{\n        volatile unsigned long long mybench_dead_sink = 0x{tag}ULL;\n        mybench_dead_sink ^= 0x{tag}ULL;\n        (void)mybench_dead_sink;\n    }}\n"
+            strategy = "volatile_false_branch"
+        elif operator == "duplicate_string_injection":
+            marker = _noise_identifier(DUPLICATE_STRING_PREFIX, variant_id)
+            a, b = marker + "_a", marker + "_b"
+            helper = f'\nstatic volatile const char {a}[] = "mybench decoy diagnostic {tag}";\nstatic volatile const char {b}[] = "mybench decoy diagnostic {tag}";\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static unsigned long long {marker}(void) {{\n#else\nstatic unsigned long long {marker}(void) {{\n#endif\n    return (unsigned char){a}[0] ^ (unsigned char){b}[0];\n}}\n'
+            body = f"\n    {{\n        volatile unsigned long long mybench_duplicate_sink = {marker}();\n        (void)mybench_duplicate_sink;\n    }}\n"
+            strategy = "volatile_duplicate_literals"
+        elif operator == "irrelevant_syscall_injection":
+            marker = _noise_identifier(IRRELEVANT_SYSCALL_PREFIX, variant_id)
+            helper = f"\n#if defined(__unix__) || defined(__APPLE__)\n#include <unistd.h>\n#endif\n#if defined(__GNUC__) || defined(__clang__)\n__attribute__((noinline, used)) static long {marker}(void) {{\n#else\nstatic long {marker}(void) {{\n#endif\n#if defined(__unix__) || defined(__APPLE__)\n    return (long)getpid();\n#else\n    return 0L;\n#endif\n}}\n"
+            body = f"\n    {{\n        volatile unsigned long long mybench_syscall_gate = 0x{tag}ULL;\n        if ((mybench_syscall_gate ^ 0x{tag}ULL) == 1ULL) {{\n            volatile long mybench_syscall_sink = {marker}();\n            (void)mybench_syscall_sink;\n        }}\n    }}\n"
+            strategy = "guarded_getpid_read_only"
+        else:
+            raise ValueError(f"unknown source noise operator: {operator}")
+        insert_at = function_match.end()
+        return _append_noise_operation(source, relative_path, operator, before_hash, marker, strategy,
+                                       helper + content[:insert_at] + body + content[insert_at:])
+
+    # Python and Go are common challenge runtimes.  Their fragments are
+    # appended at module scope so they remain valid even when the source has a
+    # challenge-specific main routine or package layout.
+    if suffix == ".py":
+        marker = _noise_identifier({
+            "decoy_function_injection": DECOY_FUNCTION_PREFIX,
+            "dead_code_injection": DEAD_CODE_PREFIX,
+            "duplicate_string_injection": DUPLICATE_STRING_PREFIX,
+            "irrelevant_syscall_injection": IRRELEVANT_SYSCALL_PREFIX,
+        }[operator], variant_id)
+        if operator == "decoy_function_injection":
+            fragment = f"\n\ndef {marker}(seed=0x{tag}):\n    state = seed ^ 0x{tag}\n    return state + 0x{tag}\n"
+            strategy = "unused_module_function"
+        elif operator == "dead_code_injection":
+            fragment = f"\n\ndef {marker}():\n    value = int('{tag}', 16)\n    return (value ^ value) == 1\n\nif {marker}():\n    _mybench_dead_sink = 0x{tag}\n    del _mybench_dead_sink\n"
+            strategy = "false_helper_branch"
+        elif operator == "duplicate_string_injection":
+            fragment = f"\n\n{marker}_a = 'mybench decoy diagnostic {tag}'\n{marker}_b = 'mybench decoy diagnostic {tag}'\n\ndef {marker}():\n    return {marker}_a[0] == {marker}_b[0]\n\n{marker}()\n"
+            strategy = "duplicate_module_literals"
+        elif operator == "irrelevant_syscall_injection":
+            fragment = f"\n\ndef {marker}():\n    value = int('{tag}', 16)\n    return (value ^ value) == 1\n\nif {marker}():\n    _mybench_syscall_sink = __import__('os').getpid()\n    del _mybench_syscall_sink\n"
+            strategy = "guarded_getpid_read_only"
+        else:
+            raise ValueError(f"unknown source noise operator: {operator}")
+        return _append_noise_operation(source, relative_path, operator, before_hash, marker, strategy, content + fragment)
+
+    if suffix == ".go":
+        if not re.search(r"(?m)^\s*package\s+[A-Za-z_]\w*\s*$", content):
+            return _noise_skip(source, relative_path, operator, "no Go package declaration found")
+        marker = _noise_identifier({
+            "decoy_function_injection": DECOY_FUNCTION_PREFIX,
+            "dead_code_injection": DEAD_CODE_PREFIX,
+            "duplicate_string_injection": DUPLICATE_STRING_PREFIX,
+            "irrelevant_syscall_injection": IRRELEVANT_SYSCALL_PREFIX,
+        }[operator], variant_id)
+        if operator == "decoy_function_injection":
+            fragment = (
+                f"\n\nvar {marker}_gate uint64 = 0x{tag}\n"
+                f"var {marker}_sink uint64\n\n"
+                f"//go:noinline\nfunc {marker}(seed uint64) uint64 {{\n"
+                f"\tstate := seed ^ 0x{tag}\n\treturn state + 0x{tag}\n}}\n"
+                f"func init() {{\n\tif ({marker}_gate ^ 0x{tag}) == 1 {{\n"
+                f"\t\t{marker}_sink = {marker}({marker}_gate)\n\t}}\n}}\n"
+            )
+            strategy = "noinline_guarded_package_function"
+        elif operator == "dead_code_injection":
+            fragment = (
+                f"\n\nvar {marker}_gate uint64 = 0x{tag}\n"
+                f"var {marker}_sink uint64\n\n"
+                f"//go:noinline\nfunc {marker}() bool {{\n"
+                f"\treturn ({marker}_gate ^ 0x{tag}) == 1\n}}\n"
+                f"func init() {{\n\tif {marker}() {{\n"
+                f"\t\t{marker}_sink = {marker}_gate + 1\n\t}}\n}}\n"
+            )
+            strategy = "false_init_branch"
+        elif operator == "duplicate_string_injection":
+            # Distinct mutable byte slices keep two physical copies in the
+            # binary while retaining the duplicate string literals in source.
+            literal = f"mybench decoy diagnostic {tag}"
+            fragment = (
+                f'\n\nvar {marker}_a = []byte("{literal}")\n'
+                f'var {marker}_b = []byte("{literal}")\n'
+                f"var {marker}_sink byte\n\n"
+                f"//go:noinline\nfunc {marker}() byte {{\n"
+                f"\treturn {marker}_a[0] ^ {marker}_b[0]\n}}\n"
+                f"func init() {{\n\t{marker}_sink = {marker}()\n}}\n"
+            )
+            strategy = "retained_duplicate_byte_arrays"
+        elif operator == "irrelevant_syscall_injection":
+            content = _ensure_go_os_import(content)
+            binding = _go_os_import(content)[0]
+            call = "Getpid()" if binding == "." else f"{binding}.Getpid()"
+            fragment = (
+                f"\n\nvar {marker}_gate uint64 = 0x{tag}\n"
+                f"var {marker}_sink int\n\n"
+                f"//go:noinline\nfunc {marker}() int {{\n\treturn {call}\n}}\n"
+                f"func init() {{\n\tif ({marker}_gate ^ 0x{tag}) == 1 {{\n"
+                f"\t\t{marker}_sink = {marker}()\n\t}}\n}}\n"
+            )
+            strategy = "guarded_getpid_read_only"
+        else:
+            raise ValueError(f"unknown source noise operator: {operator}")
+        return _append_noise_operation(source, relative_path, operator, before_hash, marker, strategy, content + fragment)
+
+    if suffix == ".rs":
+        main_match = re.search(r"\bfn\s+main\s*\([^{};]*\)\s*(?:->\s*[^{}]+)?\{", content)
+        if main_match is None:
+            return _noise_skip(source, relative_path, operator, "no compatible Rust main function definition found")
+        marker = _noise_identifier({
+            "decoy_function_injection": DECOY_FUNCTION_PREFIX,
+            "dead_code_injection": DEAD_CODE_PREFIX,
+            "duplicate_string_injection": DUPLICATE_STRING_PREFIX,
+            "irrelevant_syscall_injection": IRRELEVANT_SYSCALL_PREFIX,
+        }[operator], variant_id)
+        if operator == "decoy_function_injection":
+            fragment = f"\n\n#[inline(never)]\nfn {marker}(seed: u64) -> u64 {{\n    let state = seed ^ 0x{tag}u64;\n    state.wrapping_add(0x{tag}u64)\n}}\n"
+            body = f"\n    let _ = std::hint::black_box({marker} as fn(u64) -> u64);\n"
+            strategy = "retained_uncalled_rust_function"
+        elif operator == "dead_code_injection":
+            fragment = f"\n\n#[inline(never)]\nfn {marker}() -> bool {{\n    let state: u64 = 0x{tag}u64;\n    let observed = unsafe {{ std::ptr::read_volatile(&state) }};\n    (observed ^ 0x{tag}u64) == 1u64\n}}\n"
+            body = f"\n    if {marker}() {{\n        let _ = std::hint::black_box(0x{tag}u64);\n    }}\n"
+            strategy = "volatile_false_rust_branch"
+        elif operator == "duplicate_string_injection":
+            literal = f"mybench decoy diagnostic {tag}"
+            fragment = f'\n\n#[used]\n#[allow(non_upper_case_globals)]\nstatic mut {marker}_a: [u8; {len(literal)}] = *b"{literal}";\n#[used]\n#[allow(non_upper_case_globals)]\nstatic mut {marker}_b: [u8; {len(literal)}] = *b"{literal}";\n#[inline(never)]\nfn {marker}() -> u8 {{\n    unsafe {{\n        std::ptr::read_volatile(std::ptr::addr_of!({marker}_a).cast::<u8>())\n            ^ std::ptr::read_volatile(std::ptr::addr_of!({marker}_b).cast::<u8>())\n    }}\n}}\n'
+            body = f"\n    let _ = std::hint::black_box({marker}());\n"
+            strategy = "volatile_duplicate_rust_literals"
+        elif operator == "irrelevant_syscall_injection":
+            fragment = f"\n\n#[inline(never)]\nfn {marker}() -> u32 {{\n    std::process::id()\n}}\n"
+            body = f"\n    {{\n        let gate: u64 = 0x{tag}u64;\n        let observed = unsafe {{ std::ptr::read_volatile(&gate) }};\n        if (observed ^ 0x{tag}u64) == 1u64 {{\n            let _ = std::hint::black_box({marker}());\n        }}\n    }}\n"
+            strategy = "guarded_process_id_read_only"
+        else:
+            raise ValueError(f"unknown source noise operator: {operator}")
+        insert_at = main_match.end()
+        mutated = content[:insert_at] + body + content[insert_at:] + fragment
+        return _append_noise_operation(source, relative_path, operator, before_hash, marker, strategy, mutated)
+
+    if suffix == ".java":
+        marker = _noise_identifier({
+            "decoy_function_injection": DECOY_FUNCTION_PREFIX,
+            "dead_code_injection": DEAD_CODE_PREFIX,
+            "duplicate_string_injection": DUPLICATE_STRING_PREFIX,
+            "irrelevant_syscall_injection": IRRELEVANT_SYSCALL_PREFIX,
+        }[operator], variant_id)
+        bounds = _java_class_bounds(content, source.stem)
+        if bounds is None:
+            return _noise_skip(source, relative_path, operator, "no compatible Java class definition found")
+        insert_at = bounds[1]
+        if operator == "decoy_function_injection":
+            fragment = f'\n    @SuppressWarnings("unused")\n    private static long {marker}(long seed) {{\n        long state = seed ^ 0x{tag}L;\n        return state + 0x{tag}L;\n    }}\n'
+            strategy = "unused_java_method"
+        elif operator == "dead_code_injection":
+            fragment = f'\n    @SuppressWarnings("unused")\n    private static void {marker}() {{\n        long state = 0x{tag}L;\n        if ((state ^ 0x{tag}L) == 1L) {{\n            long sink = state + 1L;\n            if (sink == Long.MIN_VALUE) System.out.print("");\n        }}\n    }}\n'
+            strategy = "dead_java_branch"
+        elif operator == "duplicate_string_injection":
+            fragment = f'\n    @SuppressWarnings("unused")\n    private static final String {marker}_a = "mybench decoy diagnostic {tag}";\n    @SuppressWarnings("unused")\n    private static final String {marker}_b = "mybench decoy diagnostic {tag}";\n    @SuppressWarnings("unused")\n    private static int {marker}() {{\n        return {marker}_a.charAt(0) ^ {marker}_b.charAt(0);\n    }}\n'
+            strategy = "duplicate_java_literals"
+        elif operator == "irrelevant_syscall_injection":
+            fragment = f'\n    @SuppressWarnings("unused")\n    private static long {marker}() {{\n        if (Boolean.FALSE.booleanValue()) {{\n            return ProcessHandle.current().pid();\n        }}\n        return 0L;\n    }}\n'
+            strategy = "guarded_process_id_read_only"
+        else:
+            raise ValueError(f"unknown source noise operator: {operator}")
+        mutated = content[:insert_at] + fragment + content[insert_at:]
+        return _append_noise_operation(source, relative_path, operator, before_hash, marker, strategy, mutated)
+
+    if suffix in {".js", ".jsx", ".ts", ".tsx"}:
+        marker = _noise_identifier({
+            "decoy_function_injection": DECOY_FUNCTION_PREFIX,
+            "dead_code_injection": DEAD_CODE_PREFIX,
+            "duplicate_string_injection": DUPLICATE_STRING_PREFIX,
+            "irrelevant_syscall_injection": IRRELEVANT_SYSCALL_PREFIX,
+        }[operator], variant_id)
+        if operator == "decoy_function_injection":
+            fragment = f"\n\nfunction {marker}(seed = 0x{tag}) {{\n  const state = seed ^ 0x{tag};\n  return state + 0x{tag};\n}}\n"
+            strategy = "unused_module_function"
+        elif operator == "dead_code_injection":
+            fragment = f"\n\nfunction {marker}() {{\n  const value = 0x{tag};\n  return (value ^ value) === 1;\n}}\nif ({marker}()) {{\n  const mybenchDeadSink = 0x{tag};\n  void mybenchDeadSink;\n}}\n"
+            strategy = "false_module_branch"
+        elif operator == "duplicate_string_injection":
+            fragment = f'\n\nconst {marker}_a = "mybench decoy diagnostic {tag}";\nconst {marker}_b = "mybench decoy diagnostic {tag}";\nfunction {marker}() {{ return {marker}_a[0] === {marker}_b[0]; }}\n{marker}();\n'
+            strategy = "duplicate_module_literals"
+        elif operator == "irrelevant_syscall_injection":
+            fragment = f"\n\nfunction {marker}() {{\n  return typeof process === 'undefined' ? 0 : process.pid;\n}}\nconst mybenchSyscallGate_{tag} = 0x{tag};\nif ((mybenchSyscallGate_{tag} ^ 0x{tag}) === 1) {{ void {marker}(); }}\n"
+            strategy = "guarded_process_id_read_only"
+        else:
+            raise ValueError(f"unknown source noise operator: {operator}")
+        return _append_noise_operation(source, relative_path, operator, before_hash, marker, strategy, content + fragment)
+
+    return _noise_skip(source, relative_path, operator, f"source noise has no safe injector for {suffix or '<none>'}")
 
 
 def _mutate_source_noise(source: Path, relative_path: Path, variant_id: str,
@@ -264,8 +567,13 @@ def _mutate_source_noise(source: Path, relative_path: Path, variant_id: str,
         if limits is not None and limits.get(key, 0) <= 0:
             results.append(_noise_skip(source, relative_path, operator, f"operator disabled by policy limit {key}=0"))
         else:
-            results.append(_inject_c_noise(source, relative_path, variant_id, operator))
+            results.append(_inject_source_noise(source, relative_path, variant_id, operator))
     return results
+
+
+# Backwards-compatible private alias for callers that used the original
+# C-only helper while the injector was being generalized by language.
+_inject_c_noise = _inject_source_noise
 
 
 def _mutate_source(source: Path, relative_path: Path, variant_id: str) -> Dict[str, Any]:
@@ -348,7 +656,7 @@ def _mutate_source(source: Path, relative_path: Path, variant_id: str) -> Dict[s
         strategy = "opaque_guard_injection"
     elif suffix == ".go":
         mutated = content + (
-            f"\n\nfunc {ident}() bool {{\n"
+            f"\n\n//go:noinline\nfunc {ident}() bool {{\n"
             f"\tvar value uint64 = 0x{tag}\n"
             f"\treturn (value ^ value) == 1\n"
             f"}}\n\n"
@@ -360,6 +668,62 @@ def _mutate_source(source: Path, relative_path: Path, variant_id: str) -> Dict[s
             f"}}\n"
         )
         strategy = "opaque_guard_injection"
+    elif suffix == ".rs":
+        main_match = re.search(r"\bfn\s+main\s*\([^{};]*\)\s*(?:->\s*[^{}]+)?\{", content)
+        if main_match is None:
+            return {
+                "operator": "source_mutation_skipped",
+                "path": relative_path.as_posix(),
+                "reason": "no compatible Rust main function definition found",
+                "before_sha256": before_hash,
+                "after_sha256": before_hash,
+                "changed": False,
+            }
+        guard_function = (
+            f"\n#[inline(never)]\nfn {ident}() -> bool {{\n"
+            f"    let value: u64 = 0x{tag}u64;\n"
+            f"    let observed = unsafe {{ std::ptr::read_volatile(&value) }};\n"
+            f"    (observed ^ 0x{tag}u64) == 1u64\n"
+            f"}}\n"
+        )
+        branch = (
+            f"\n    if {ident}() {{\n"
+            f"        let _mybench_guard_sink: u64 = 0;\n"
+            f"        let _ = _mybench_guard_sink;\n"
+            f"    }}\n"
+        )
+        insert_at = main_match.end()
+        # Inner crate attributes must remain before all items.
+        mutated = content[:insert_at] + branch + content[insert_at:] + guard_function
+        strategy = "volatile_rust_guard_injection"
+    elif suffix == ".java":
+        bounds = _java_class_bounds(content, source.stem)
+        if bounds is None or bounds[2] is None:
+            return {
+                "operator": "source_mutation_skipped",
+                "path": relative_path.as_posix(),
+                "reason": "no compatible Java main/class definition found",
+                "before_sha256": before_hash,
+                "after_sha256": before_hash,
+                "changed": False,
+            }
+        _, class_end, main_end = bounds
+        guard_method = (
+            f"\n    private static volatile long {ident}_value = 0x{tag}L;\n"
+            f"\n    private static boolean {ident}() {{\n"
+            f"        long value = {ident}_value;\n"
+            f"        return ((value ^ 0x{tag}L) == 1L);\n"
+            f"    }}\n"
+        )
+        branch = (
+            f"\n        if ({ident}()) {{\n"
+            f"            long mybenchGuardSink = 0L;\n"
+            f"            if (mybenchGuardSink == Long.MIN_VALUE) System.out.print(\"\");\n"
+            f"        }}\n"
+        )
+        mutated = content[:main_end] + branch + content[main_end:class_end]
+        mutated += guard_method + content[class_end:]
+        strategy = "volatile_java_guard_injection"
     else:
         return {
             "operator": "source_mutation_skipped",
@@ -385,8 +749,13 @@ def _mutate_source(source: Path, relative_path: Path, variant_id: str) -> Dict[s
 
 def _matching_compiled_target(seed: Seed, source: Path, variant_dir: Path) -> Optional[tuple[Path, Path]]:
     """Find a shipped executable whose basename matches the mutated source."""
-    target = source.with_suffix("")
-    if not target.exists() or not target.is_file() or not _probable_entrypoint(target):
+    target = source.with_suffix(".class") if source.suffix.lower() == ".java" else source.with_suffix("")
+    if not target.exists() or not target.is_file():
+        return None
+    if source.suffix.lower() == ".java":
+        if "java class" not in _file_description(target):
+            return None
+    elif not _probable_entrypoint(target):
         return None
     relative = target.relative_to(seed.seed_path)
     copied = variant_dir / relative
@@ -401,6 +770,8 @@ def _compatible_binary_format(reference: Path, candidate: Path) -> bool:
     candidate_description = _file_description(candidate)
     if not reference_description or not candidate_description:
         return False
+    if "java class" in reference_description and "java class" in candidate_description:
+        return True
     families = ("elf", "mach-o", "pe32")
     family = next((item for item in families if item in reference_description), None)
     if family is None or family not in candidate_description:
@@ -685,6 +1056,7 @@ def _rebuild_compiled_artifact(
     variant_dir: Path,
     seed: Seed,
     source_operation: Dict[str, Any],
+    noise_operations: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Recompile a shipped source/binary pair so the mutation reaches the artifact.
 
@@ -704,12 +1076,13 @@ def _rebuild_compiled_artifact(
     source_declared = source_seed_path in seed.declared_files
     source = variant_dir / str(source_rel)
     suffix = source.suffix.lower()
-    if suffix not in {".c", ".cc", ".cpp", ".cxx"}:
+    source_only_suffixes = {".py", ".m", ".mm", ".java", ".js", ".jsx", ".ts", ".tsx", ".rb", ".swift", ".sol"}
+    if suffix not in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".rs", ".go", ".java"}:
         return {
             "operator": "compiled_artifact_rebuild_skipped",
             "source": str(source_rel),
-            "required": not source_declared,
-            "reason": f"automatic rebuild supports C/C++ only, got {suffix or '<none>'}",
+            "required": not source_declared and suffix not in source_only_suffixes,
+            "reason": "source-only challenge; no local compiled artifact to rebuild" if suffix in source_only_suffixes else "interpreted source; deployment requires declared source or a matching runtime entrypoint",
             "changed": False,
         }
     match = _matching_compiled_target(seed, seed.seed_path / str(source_rel), variant_dir)
@@ -717,27 +1090,54 @@ def _rebuild_compiled_artifact(
         return {
             "operator": "compiled_artifact_rebuild_skipped",
             "source": str(source_rel),
-            "required": not source_declared,
+            "required": not source_declared and suffix not in source_only_suffixes and suffix not in {".rs", ".go"},
             "reason": "no shipped executable with the source basename",
             "changed": False,
         }
     original_target, target = match
     before_hash = sha256_file(target)
-    cfg_before = _cfg_witness(original_target)
+    cfg_before = None if suffix == ".java" else _cfg_witness(original_target)
     temporary = target.with_name(target.name + ".mybench-build")
     include_dirs = sorted({str(path.parent) for path in variant_dir.rglob("*") if path.is_dir()})
     source_rel_in_variant = source.relative_to(variant_dir).as_posix()
     target_rel_in_variant = temporary.relative_to(variant_dir).as_posix()
     attempts: List[tuple[str, List[str], Path]] = []
-    compiler = shutil.which("g++" if suffix in {".cc", ".cpp", ".cxx"} else "gcc")
-    language_standard = "c++11" if suffix in {".cc", ".cpp", ".cxx"} else "gnu11"
+    if suffix == ".rs":
+        compiler = shutil.which("rustc")
+        language_standard = None
+    elif suffix == ".go":
+        compiler = shutil.which("go")
+        language_standard = None
+    elif suffix == ".java":
+        compiler = shutil.which("javac")
+        language_standard = None
+    elif suffix in {".m", ".mm"}:
+        compiler = shutil.which("clang++" if suffix == ".mm" else "clang")
+        language_standard = "c++11" if suffix == ".mm" else "gnu11"
+    else:
+        compiler = shutil.which("g++" if suffix in {".cc", ".cpp", ".cxx"} else "gcc")
+        language_standard = "c++11" if suffix in {".cc", ".cpp", ".cxx"} else "gnu11"
     if compiler:
-        command = [compiler, f"-std={language_standard}", "-O0", "-g0", "-fno-omit-frame-pointer"]
-        command.extend(f"-I{path}" for path in include_dirs[:80])
-        command.extend([str(source), "-o", str(temporary)])
+        if suffix == ".rs":
+            command = [compiler, "--edition=2021", "-C", "opt-level=0", "-C", "debuginfo=0"]
+            command.extend([str(source), "-o", str(temporary)])
+        elif suffix == ".go":
+            # Build the selected file directly.  This avoids pulling in test
+            # packages or unrelated challenge tools while still supporting a
+            # self-contained Go entrypoint with the matching basename.
+            command = [compiler, "build", "-o", str(temporary), str(source)]
+        elif suffix == ".java":
+            class_dir = temporary.with_name(temporary.name + ".classes")
+            class_dir.mkdir(parents=True, exist_ok=True)
+            major = int.from_bytes(original_target.read_bytes()[6:8], "big")
+            command = [compiler, "-proc:none", "--release", str(major - 44), "-d", str(class_dir), str(source)]
+        else:
+            command = [compiler, f"-std={language_standard}", "-O0", "-g0", "-fno-omit-frame-pointer"]
+            command.extend(f"-I{path}" for path in include_dirs[:80])
+            command.extend([str(source), "-o", str(temporary)])
         attempts.append((compiler, command, variant_dir))
 
-    docker = shutil.which("docker")
+    docker = shutil.which("docker") if suffix in {".c", ".cc", ".cpp", ".cxx"} else None
     docker_image = os.environ.get("MYBENCH_BUILD_IMAGE", "gcc:12-bookworm")
     docker_available = False
     if docker:
@@ -790,7 +1190,18 @@ def _rebuild_compiled_artifact(
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             failures.append(f"{tool_name}: {exc}")
+            if suffix == ".java":
+                shutil.rmtree(temporary.with_name(temporary.name + ".classes"), ignore_errors=True)
             continue
+        if suffix == ".java":
+            class_dir = temporary.with_name(temporary.name + ".classes")
+            candidates = sorted(class_dir.rglob("*.class")) if class_dir.exists() else []
+            if result.returncode == 0 and len(candidates) == 1 and candidates[0].name == target.name:
+                shutil.copy2(candidates[0], temporary)
+            elif result.returncode == 0:
+                failures.append(f"{tool_name}: class outputs need a multi-class deployment mapping")
+            if class_dir.exists():
+                shutil.rmtree(class_dir, ignore_errors=True)
         if result.returncode != 0 or not temporary.exists():
             failures.append(f"{tool_name}: compiler returned {result.returncode}: {result.stdout[-500:]}")
             continue
@@ -801,7 +1212,16 @@ def _rebuild_compiled_artifact(
             )
             temporary.unlink()
             continue
-        cfg_after = _cfg_witness(temporary)
+        expected_markers = [source_operation.get("marker")] + [
+            op.get("marker") for op in (noise_operations or []) if op.get("changed")
+        ]
+        artifact_bytes = temporary.read_bytes()
+        missing_markers = [marker for marker in expected_markers if marker and marker.encode() not in artifact_bytes]
+        if missing_markers:
+            failures.append(f"{tool_name}: rebuilt artifact dropped injected symbols: {', '.join(missing_markers)}")
+            temporary.unlink()
+            continue
+        cfg_after = None if suffix == ".java" else _cfg_witness(temporary)
         if cfg_before is not None and cfg_after is not None and cfg_before == cfg_after:
             failures.append(f"{tool_name}: CFG witness did not change ({cfg_before})")
             temporary.unlink()
@@ -824,7 +1244,8 @@ def _rebuild_compiled_artifact(
             "changed": False,
         }
 
-    temporary.chmod(target.stat().st_mode | 0o111)
+    if suffix != ".java":
+        temporary.chmod(target.stat().st_mode | 0o111)
     target.unlink()
     temporary.replace(target)
     after_hash = sha256_file(target)
@@ -833,6 +1254,8 @@ def _rebuild_compiled_artifact(
         "source": str(source_rel),
         "path": target.relative_to(variant_dir).as_posix(),
         "marker": source_operation.get("marker"),
+        "noise_markers": [op["marker"] for op in (noise_operations or []) if op.get("changed") and op.get("marker")],
+        "artifact_format": "java_class" if suffix == ".java" else "native",
         "compiler": selected_tool,
         "command": selected_command,
         "output": selected_output,
@@ -1010,7 +1433,10 @@ def create_variant(
             )
         )
         if source_operation.get("operator") == "opaque_guard_injection":
-            rebuild_operation = _rebuild_compiled_artifact(variant_dir, seed, source_operation)
+            rebuild_operation = _rebuild_compiled_artifact(
+                variant_dir, seed, source_operation,
+                [op for op in operations if op.get("operator") in SOURCE_NOISE_OPERATORS],
+            )
             operations.append(rebuild_operation)
             if rebuild_operation.get("operator") == "compiled_artifact_rebuild_skipped" and rebuild_operation.get("required"):
                 pending_source_rollback = (copied_source, seed.seed_path / relative_source, source_operation)

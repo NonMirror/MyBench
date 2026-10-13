@@ -63,8 +63,13 @@ def _run(command: List[str], cwd: Path, timeout: int) -> Dict[str, Any]:
 def _syntax_check(variant_dir: Path, source_rel: str) -> Dict[str, Any]:
     source = variant_dir / source_rel
     suffix = source.suffix.lower()
-    if suffix in {".c", ".cc", ".cpp", ".cxx"}:
-        compiler = shutil.which("g++" if suffix in {".cc", ".cpp", ".cxx"} else "gcc")
+    if suffix in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}:
+        if suffix in {".mm"}:
+            compiler = shutil.which("clang++")
+        elif suffix in {".m"}:
+            compiler = shutil.which("clang")
+        else:
+            compiler = shutil.which("g++" if suffix in {".cc", ".cpp", ".cxx"} else "gcc")
         if not compiler:
             return {"status": "skipped", "reason": "compiler unavailable"}
         include_dirs = sorted({str(p.parent) for p in variant_dir.rglob("*") if p.is_dir()})
@@ -85,9 +90,28 @@ def _syntax_check(variant_dir: Path, source_rel: str) -> Dict[str, Any]:
         if not gofmt:
             return {"status": "skipped", "reason": "gofmt unavailable"}
         command = [gofmt, "-d", str(source)]
+    elif suffix == ".rs":
+        rustc = shutil.which("rustc")
+        if not rustc:
+            return {"status": "skipped", "reason": "rustc unavailable"}
+        # Metadata-only compilation catches syntax/type errors without
+        # producing an executable in the variant tree.  External challenge
+        # crates may still produce a warning, which is reported below.
+        output = Path(tempfile.mkdtemp(prefix="mybench-rust-check-")) / "check.rmeta"
+        command = [rustc, "--edition=2021", "--emit=metadata", "-o", str(output), str(source)]
+    elif suffix == ".java":
+        javac = shutil.which("javac")
+        if not javac:
+            return {"status": "skipped", "reason": "javac unavailable"}
+        output = Path(tempfile.mkdtemp(prefix="mybench-java-check-"))
+        command = [javac, "-proc:none", "-d", str(output), str(source)]
     else:
         return {"status": "skipped", "reason": f"no syntax checker for {suffix or 'unknown'}"}
     result = _run(command, variant_dir, timeout=20)
+    if suffix == ".rs":
+        shutil.rmtree(Path(command[command.index("-o") + 1]).parent, ignore_errors=True)
+    elif suffix == ".java":
+        shutil.rmtree(Path(command[command.index("-d") + 1]), ignore_errors=True)
     # gofmt uses exit code 1 to report formatting differences while still
     # successfully parsing the file; only an actual tool failure is a syntax
     # warning for this lightweight check.
@@ -306,9 +330,14 @@ def validate_manifest(manifest_path: Path, build: bool = False) -> Dict[str, Any
                 marker = operation.get("marker")
                 if not marker or not _binary_has_symbol(artifact, str(marker)):
                     errors.append(f"rebuilt artifact lacks injected symbol: {operation.get('path')}")
+                for noise_marker in operation.get("noise_markers", []):
+                    if not _binary_has_symbol(artifact, str(noise_marker)):
+                        errors.append(f"rebuilt artifact lacks noise symbol {noise_marker}: {operation.get('path')}")
                 cfg_before = operation.get("cfg_before")
                 cfg_function = operation.get("function_addr", operation.get("function", "main"))
-                cfg_after = operation.get("cfg_after") or _cfg_witness(artifact, cfg_function)
+                cfg_after = operation.get("cfg_after")
+                if cfg_after is None and operation.get("artifact_format") != "java_class":
+                    cfg_after = _cfg_witness(artifact, cfg_function)
                 if cfg_before is not None and cfg_after is not None:
                     if cfg_before == cfg_after:
                         errors.append(f"rebuilt artifact CFG witness did not change: {operation.get('path')}")
