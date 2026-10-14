@@ -67,6 +67,87 @@ uv run mybench pipeline --ctfbench ../CTFbench --output ./generated \
 将某个 `limits` 项设为 `0` 会保留该 operator 的 skipped provenance。生成器只使用
 普通源码级构造，不实现控制流平坦化、虚拟化、加壳或壳加载器。
 
+### 实例：`2016q-rev-rock` 的 CFG 前后对比
+
+下面比较 seed 中的 `rock` 和 `generated/variants/rev/development/2016q-rev-rock__v01/rock`。
+节点和边来自 radare2 对真实二进制 `main` 的 `afbj` 结果；图中只压缩了基本块内的指令文本，
+没有凭空补画控制流。地址变化是因为 seed 与本机重建产物的装载布局不同，不影响拓扑比较。
+
+| 指标 | 变异前 | 变异后 | 变化 |
+| --- | ---: | ---: | ---: |
+| 基本块 | 4 | 12 | +200% |
+| CFG 边 | 4 | 15 | +275% |
+| 条件分支点 | 1 | 5 | +400% |
+| `main` 指令数 | 156 | 235 | +50.6% |
+
+```mermaid
+flowchart LR
+  subgraph before["变异前 main：4 blocks / 4 edges"]
+    direction TB
+    B0["0x401260<br/>输入、校验与原始主体<br/>104 instructions"]
+    B1["0x401428<br/>成功输出路径<br/>39 instructions"]
+    B2["0x4014d3<br/>对象清理<br/>9 instructions"]
+    B3["0x401569<br/>return<br/>4 instructions"]
+    B0 -->|通过校验| B1
+    B0 -->|未通过| B2
+    B1 --> B2
+    B2 --> B3
+  end
+
+  subgraph after["变异后 main：12 blocks / 15 edges"]
+    direction TB
+    A0["0x25f4<br/>无关 syscall guard"]
+    A1["0x263b<br/>getpid 干扰路径"]
+    A2["0x264e<br/>重复字符串读取<br/>dead-code guard"]
+    A3["0x266f<br/>dead-code 干扰路径"]
+    A4["0x26a2<br/>opaque guard"]
+    A5["0x26b0<br/>opaque sink"]
+    A6["0x26c2<br/>原始主体与校验"]
+    A7["0x291f<br/>原始成功输出路径"]
+    A8["0x2a1d<br/>对象清理与 canary 检查"]
+    A9["0x2a55<br/>canary 异常路径"]
+    A10["0x2aef<br/>__stack_chk_fail"]
+    A11["0x2af4<br/>return"]
+
+    A0 -.->|guard 命中| A1
+    A0 -->|正常路径| A2
+    A1 --> A2
+    A2 -.->|guard 命中| A3
+    A2 -->|正常路径| A4
+    A3 --> A4
+    A4 -.->|guard 命中| A5
+    A4 -->|正常路径| A6
+    A5 --> A6
+    A6 -->|通过校验| A7
+    A6 -->|未通过| A8
+    A7 --> A8
+    A8 -->|canary 正常| A11
+    A8 -.->|canary 异常| A9
+    A9 --> A10
+  end
+
+  classDef seed fill:#e8eef7,stroke:#496a9b,color:#172b4d;
+  classDef injected fill:#fff1b8,stroke:#d48806,color:#5c3b00,stroke-width:2px;
+  classDef original fill:#d9f7e8,stroke:#238636,color:#123d20;
+  classDef compiler fill:#f0e7ff,stroke:#8250df,color:#3b1f69;
+  class B0,B1,B2,B3 seed;
+  class A0,A1,A2,A3,A4,A5 injected;
+  class A6,A7 original;
+  class A8,A9,A10,A11 compiler;
+```
+
+黄色节点是 MyBench 注入的三个条件干扰区域，绿色节点是原题主逻辑，紫色节点是重建产物中的
+清理和栈保护路径。仅看注入区域，`main` 已增加三组 diamond 分支；整体基本块变为 3 倍、边变为
+3.75 倍，且正常执行仍沿实线绕过干扰体。这个幅度已经满足“肉眼可辨”的复杂度目标，因此没有
+继续增加分支数量。继续堆叠会放大编译失败面和性能扰动，却不会提供同等价值的新分析结构。
+
+可用下面的命令复核原始数据：
+
+```bash
+r2 -2 -q -c 'aa; afbj @ main; q' ../CTFbench/development/2016/CSAW-Quals/rev/Rock/rock
+r2 -2 -q -c 'aa; afbj @ main; q' generated/variants/rev/development/2016q-rev-rock__v01/rock
+```
+
 ### 当前手法与样本覆盖
 
 下面的“生效”表示对应 operation 的 `changed: true`，并且变体中的源码或部署制品通过了后置校验。
