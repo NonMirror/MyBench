@@ -31,13 +31,6 @@
   `run_variant.sh` 入口包装，注入可复现的 variant/parent 环境标识，并记录降级路径。
 - `run_variant.sh` 和 `variant_runtime.json` 是运行时打包/元数据操作，不计作源码级的
   pwn/rev 变异。
-- 所有变体都复制题目目录，但默认使用 hardlink + copy-on-write，避免为 110 道题重复
-  占用数百 MB；写入变异文件前会先解除 hardlink，不会修改 `CTFbench`。
-- 公共 `challenge.json` 会移除 `flag`、`answer`、`solution`、`secret` 和 `key` 字段；
-  明显的 `flag`、answer、solution、test_solver 和 writeup 文件也会从变体目录移除，
-  manifest 只保存 secret 的哈希。被选中的源码会执行上面的源码级变异；未被选中的
-  源码和压缩包不会被自动重写，其中的内嵌常量会在 manifest 中明确标记为未脱敏，
-  便于后续接入专门的 oracle 分离流程。
 - 验证器检查题目清单文件、声明的题目文件、opaque guard 符号、变异哈希、入口包装和
   manifest 一致性，并重新读取二进制补丁位置、哈希和 CFG witness。报告中的
   `substantive_artifact_mutations` 单独统计真实部署制品变异，避免“验证通过”被误读为
